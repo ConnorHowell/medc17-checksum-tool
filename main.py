@@ -483,7 +483,7 @@ class MEDC17BinaryParser:
         +0x04: Size (dword)
         +0x0C: Block end address (dword)
         +0x1A: Software identifier (10 bytes)
-        +0x28: Number of checksum structures (dword)
+        +0x2C: Number of checksum structures (dword)
         +0x30: Checksum adjust (dword)
         +0x34: Checksum structures start (32 bytes each)
         Last: Final checksum (dword)
@@ -500,7 +500,7 @@ class MEDC17BinaryParser:
         identifier_length = 10
         sw_identifier = self.data[flat_address + 26:flat_address + 26 + identifier_length]
 
-        # Number of checksum structures at offset +0x28 (26 + 10 + 8)
+        # Number of checksum structures at offset +0x2C (26 + 10 + 8)
         num_checksum_structures = self.read_dword_le(flat_address + 26 + identifier_length + 8)
 
         # Calculate block start from block_end and size
