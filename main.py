@@ -784,13 +784,14 @@ class MEDC17BinaryParser:
 
         # Note: Like ADD32, the last 4 bytes (adjustment value) are NOT included
         # Process 32-bit values, but sum them as two 16-bit words
-        while pos + 3 <= end_inclusive:
-            dword = struct.unpack('<I', self.data[pos:pos+4])[0]
-            pos += 4
-            # Extract low 16 bits and high 16 bits, add both
-            low_word = dword & 0xFFFF
-            high_word = (dword >> 16) & 0xFFFF
-            checksum = (checksum + low_word + high_word) & 0xFFFFFFFF
+        while pos <= end_inclusive - 2:
+            word = self.data[pos] | (self.data[pos + 1] << 8)
+            pos += 2
+            checksum = (checksum + word) & 0xFFFFFFFF
+
+        # Last 16-bit word goes into the high 16 bits
+        word = self.data[pos] | (self.data[pos + 1] << 8)
+        checksum: int = (checksum + (word << 16)) & 0xFFFFFFFF
 
         return checksum
 
