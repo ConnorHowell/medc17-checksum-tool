@@ -27,6 +27,8 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich import box
 from rich.text import Text
 
+import re
+
 # Rich console for styled output
 console = Console()
 
@@ -409,6 +411,11 @@ class BoschBlock:
     block_identifier: int
     block_name: str
     size: int
+    next_sector: int
+    table1_pointer: int
+    table2_pointer: int
+    table1_size: int
+    table2_size: int
     sw_identifier: bytes
     num_checksum_structures: int
     checksum_adjust: int
@@ -503,26 +510,22 @@ class MEDC17BinaryParser:
     def parse_block(self, flat_address: int) -> Optional[BoschBlock]:
         """
         Parse Bosch block at given offset
-
-        Block structure (little-endian):
-        +0x00: Block identifier (dword)
-        +0x04: Size (dword)
-        +0x0C: Block end address (dword)
-        +0x1A: Software identifier (10 bytes)
-        +0x2C: Number of checksum structures (dword)
-        +0x30: Checksum adjust (dword)
-        +0x34: Checksum structures start (32 bytes each)
-        Last: Final checksum (dword)
-
-        Returns None if the data at flat_address doesn't look like a valid block.
+        
+        Updated to match working detection script.
         """
-        if flat_address + 0x40 > len(self.data):
+        if flat_address + 0x34 > len(self.data):
             return None
 
-        # Read block header
+        # Read block header fields
         block_identifier = self.read_dword_le(flat_address)
         size = self.read_dword_le(flat_address + 4)
+        next_sector = self.read_dword_le(flat_address + 8)
         block_end = self.read_dword_le(flat_address + 12)
+        
+        table1_pointer = self.read_dword_le(flat_address + 16)
+        table2_pointer = self.read_dword_le(flat_address + 20)
+        table1_size = self.read_byte(flat_address + 24)
+        table2_size = self.read_byte(flat_address + 25)
 
         # Validate block type ID is known
         block_type_id = block_identifier & 0xFF
@@ -533,39 +536,33 @@ class MEDC17BinaryParser:
         if size < 0x40 or size > len(self.data) or flat_address + size > len(self.data):
             return None
 
-        # Validate block ends with DEADBEEF marker (little-endian)
+        # Validate block ends with DEADBEEF marker (optional but common)
+        # Note: We've made this non-strict as some blocks might have padding
         block_end_offset = flat_address + size - 4
-        if self.read_dword_le(block_end_offset) != 0xDEADBEEF:
-            return None
-
-        # Validate block_end is a valid TriCore flash address
-        if not self._is_flash_addr(block_end):
-            return None
+        # if self.read_dword_le(block_end_offset) != 0xDEADBEEF:
+        #    print_warning(f"Block at 0x{flat_address:X} does not end with DEADBEEF")
 
         # Software identifier at offset +0x1A (26)
-        identifier_length = 10
+        identifier_length = 18
         sw_identifier = self.data[flat_address + 26:flat_address + 26 + identifier_length]
 
-        # Number of checksum structures at offset +0x2C (26 + 10 + 8)
-        num_checksum_structures = self.read_dword_le(flat_address + 26 + identifier_length + 8)
+        # Number of checksum structures at offset +0x2C (44)
+        num_checksum_structures = self.read_dword_le(flat_address + 44)
 
         # Validate number of checksum structures is reasonable
         if num_checksum_structures > 100:
             return None
 
         # Calculate block start from block_end and size
-        block_start = ((block_end + 5) - size - 1)
-
-        # Validate block_start is a valid TriCore flash address
-        if not self._is_flash_addr(block_start):
-            return None
+        # block_start = ((block_end + 3) - size + 1) # Typical logic
+        block_start = ((block_end + 5) - size - 1) # Preservation of existing logic
 
         # Checksum adjust at offset +0x30 (48)
         checksum_adjust = self.read_dword_le(flat_address + 0x30)
 
         # Read checksum structures starting at +0x34 (52)
         checksum_structures = self.read_checksum_structures(
-            flat_address + 0x34,
+            flat_address + 44 + 8, # 0x2C + 8 = 52 = 0x34
             num_checksum_structures
         )
 
@@ -584,6 +581,11 @@ class MEDC17BinaryParser:
             block_identifier=block_identifier,
             block_name=block_name,
             size=size,
+            next_sector=next_sector,
+            table1_pointer=table1_pointer,
+            table2_pointer=table2_pointer,
+            table1_size=table1_size,
+            table2_size=table2_size,
             sw_identifier=sw_identifier,
             num_checksum_structures=num_checksum_structures,
             checksum_adjust=checksum_adjust,
@@ -591,53 +593,105 @@ class MEDC17BinaryParser:
             checksum_complement=checksum_complement,
             checksum_structures=checksum_structures,
         )
+    
+    def get_memory_region_and_offset(self, address: int) -> Optional[tuple[str, int]]:
+        """
+        Convert a TriCore memory address to (memory_region, flat_offset)
+        
+        Memory mapping (internal flash is usually 4MB, split into two 2MB PMUs):
+        - pmu0: 0x80000000 - 0x801FFFFF (2MB)
+        - pmu1: 0x80800000 - 0x809FFFFF (2MB, starting at offset 0x200000 in file)
+        - externalFlash: 0x84000000 - 0x87FFFFFB
+        """
+        if 0x80000000 <= address <= 0x801FFFFF:
+            return ('pmu0', address - 0x80000000)
+        elif 0x80800000 <= address <= 0x809FFFFF:
+            # PMU1 follows PMU0 at 2MB offset in the binary dump
+            return ('pmu1', address - 0x80800000 + 0x200000)
+        elif 0x84000000 <= address <= 0x87FFFFFB:
+            return ('externalFlash', address - 0x84000000)
+        return None
 
     def find_bosch_blocks(self) -> None:
-        """Find all Bosch blocks by scanning for non-zero bytes after padding"""
+        """Find all Bosch blocks by following nextSector chain"""
         print("\n[*] Scanning for Bosch checksum blocks...")
-
-        # Clear existing blocks before re-scanning
         self.bosch_blocks = []
-
-        # Find first block (first non-zero byte)
-        current_pos = self.find_next_nonzero(0)
-        if current_pos is None:
-            print("[!] No blocks found (file is all zeros)")
+        
+        # Standard starting address (PMU0 + 0x18000)
+        start_addr = 0x80018000
+        
+        current_addr = None
+        result = self.get_memory_region_and_offset(start_addr)
+        if result:
+            _, flat_offset = result
+            if self.parse_block(flat_offset):
+                current_addr = start_addr
+                print_info(f"Detected block chain start at 0x{start_addr:X}")
+        
+        if current_addr is None:
+            # Fallback to other known standard offsets
+            potential_starts = [0x80004000, 0x8000C000, 0x80000000]
+            for s_addr in potential_starts:
+                res = self.get_memory_region_and_offset(s_addr)
+                if res and self.parse_block(res[1]):
+                    current_addr = s_addr
+                    print_info(f"Detected block chain start at 0x{s_addr:X} (alternative)")
+                    break
+        
+        if current_addr is None:
+            # Last resort: brute search for 0x10 block identifier in first 128KB
+            print_warning("No block found at standard offsets, searching for first block...")
+            for offset in range(0, min(len(self.data), 0x10000), 4):
+                if self.read_dword_le(offset) == 0x10:
+                    block = self.parse_block(offset)
+                    if block:
+                        current_addr = 0x80000000 + offset
+                        print_info(f"Found potential start by signature at 0x{current_addr:X}")
+                        break
+        
+        if current_addr is None:
+            print_error("Could not locate Bosch block chain start")
             return
 
         block_count = 0
-
-        while current_pos is not None and current_pos < len(self.data):
-            block = self.parse_block(current_pos)
-
+        visited = set()
+        
+        while current_addr is not None and current_addr not in visited:
+            if current_addr in (0, 0xFFFFFFFF):
+                # End of chain markers
+                break
+                
+            visited.add(current_addr)
+            
+            result = self.get_memory_region_and_offset(current_addr)
+            if result is None:
+                print_warning(f"Chain terminated at invalid internal address 0x{current_addr:X}")
+                break
+            
+            _, flat_offset = result
+            block = self.parse_block(flat_offset)
+            
             if block is None:
-                # Not a valid block - silently skip to next non-zero region
-                next_pos = self.find_next_nonzero(current_pos + 1)
-                if next_pos is None or next_pos >= len(self.data):
-                    break
-                current_pos = next_pos
-                continue
-
-            print(f"[+] Found block {block_count + 1} at 0x{current_pos:X}: {block.block_name}")
+                # Some binaries have small gaps or different alignment
+                # Try seeking forward 4 bytes if it looks like there might be a block
+                print_error(f"Invalid block structure at 0x{current_addr:X}")
+                break
+            
+            print(f"[+] Found block {block_count + 1} at 0x{current_addr:X}: {block.block_name} (0x{block.block_identifier:X})")
             self.bosch_blocks.append(block)
             block_count += 1
-
-            # Find next block after this one
-            next_pos = self.find_next_nonzero(block.bin_end + 1)
-            if next_pos is None or next_pos >= len(self.data):
-                break
-
-            current_pos = next_pos
-
+            
+            current_addr = block.next_sector
+        
         print(f"[+] Total Bosch blocks found: {len(self.bosch_blocks)}")
+
+
 
     def identify_ecu_variant(self) -> List[str]:
         """
-        Identify ECU variant by reading variant string from Dataset block. (This could probably be done a smarter way)
+        Identify ECU variant by searching first 256 and last 256 bytes of Dataset block.
 
-        The Dataset #0 block (ID 0x60) contains variant information at offset 0x78.
-        Format: slash-separated fields, one contains the ECU variant (e.g., "EDC17_C46")
-        Example: "34/1/EDC17_C46/5/P643//C643X5L8///"
+        Searches for variant string patterns like: "34/1/EDC17_C46/5/P643//C643X5L8///"
         """
         # Look for Dataset #0 block (ID 0x60)
         dataset_block = None
@@ -649,44 +703,54 @@ class MEDC17BinaryParser:
         if not dataset_block:
             return ["Unknown (no Dataset block found)"]
 
-        # Read variant string at offset 0x78 from block start
-        variant_offset = dataset_block.bin_start + 0x78
+        found_variants = []
 
-        if variant_offset + 100 > len(self.data):  # Safety check
-            return ["Unknown (offset out of range)"]
+        # Search first 256 bytes
+        if dataset_block.bin_start + 256 <= len(self.data):
+            first_region = self.data[dataset_block.bin_start:dataset_block.bin_start + 256]
+            variants = self._extract_variants_from_region(first_region)
+            found_variants.extend(variants)
 
-        # Read up to 100 bytes or until null terminator
-        variant_data = self.data[variant_offset:variant_offset+100]
+        # Search last 256 bytes
+        if dataset_block.bin_end - 256 >= dataset_block.bin_start:
+            last_region = self.data[dataset_block.bin_end - 256:dataset_block.bin_end]
+            variants = self._extract_variants_from_region(last_region)
+            for v in variants:
+                if v not in found_variants:
+                    found_variants.append(v)
 
-        # Find null terminator or end
-        null_pos = variant_data.find(b'\x00')
-        if null_pos != -1:
-            variant_data = variant_data[:null_pos]
-
-        try:
-            variant_string = variant_data.decode('ascii', errors='ignore')
-        except:
-            return ["Unknown (decode error)"]
-
-        # Split by slashes and find the field containing MED17 or EDC17
-        fields = variant_string.split('/')
-
-        ecu_variant = None
-        for field in fields:
-            field = field.strip()
-            if 'MED17' in field or 'EDC17' in field or 'MEDC17' in field:
-                ecu_variant = field
-                break
-
-        if ecu_variant:
-            return [ecu_variant]
+        if found_variants:
+            return found_variants
         else:
-            # Fallback: show all non-empty fields
-            non_empty = [f for f in fields if f.strip()]
-            if non_empty:
-                return [f"Unknown variant (fields: {', '.join(non_empty[:3])})"]
-            else:
-                return ["Unknown"]
+            return ["Unknown (no variant pattern found)"]
+
+    def _extract_variants_from_region(self, region: bytes) -> List[str]:
+        """Extract variant strings using regex for better accuracy."""
+        variants = []
+        
+        # Pattern explanation:
+        # \d+/\d+/          -> Starts with digits/digits/ (e.g., 34/1/)
+        # (?:EDC17|MED17|MEDC17) -> Followed by one of the ECU keywords
+        # [^ \x00]+         -> Matches any non-space, non-null characters (the body)
+        # /{2,}             -> Ends with 2 or more slashes
+        pattern = rb'\d+/\d+/(?:EDC17|MED17|MEDC17)[^ \x00]+?/{2,}'
+        
+        matches = re.finditer(pattern, region)
+        
+        for match in matches:
+            try:
+                # Decode to string and clean up
+                variant_str = match.group(0).decode('ascii', errors='ignore')
+                # Standardize: Bosch strings often end with ///, we can keep or strip
+                # but usually, you want the full string including the trailing slashes
+                variant_str = variant_str.strip()
+                
+                if variant_str not in variants:
+                    variants.append(variant_str)
+            except Exception:
+                continue
+                
+        return variants
 
     def calculate_crc32_algo(self, start: int, end_inclusive: int, initial_value: int) -> int:
         """
@@ -862,7 +926,7 @@ class MEDC17BinaryParser:
 
     def _is_flash_addr(self, addr: int) -> bool:
         """Check if address is a valid TriCore flash address."""
-        return 0x80000000 <= addr <= 0x807FFFFF
+        return self.get_memory_region_and_offset(addr) is not None
 
     def find_cvn_config(self) -> Optional[CVNConfig]:
         """
@@ -1340,7 +1404,8 @@ class MEDC17BinaryParser:
         return True
 
     def correct_crc32_checksum(self, cs: ChecksumStructure, block_start_mem: int,
-                                block_start_bin: int, block_bin_end: int, data: bytearray) -> bool:
+                                block_start_bin: int, block_bin_end: int, data: bytearray,
+                                skip_signature: bool) -> bool:
         """
         Correct a CRC32 checksum by forging signature and calculating dCSAdjust.
 
@@ -1391,8 +1456,9 @@ class MEDC17BinaryParser:
         ripemd_hash = ripemd160.digest()
 
         # Forge Bleichenbacher signature and write to binary
-        forged_signature = forge_bleichenbacher_signature(ripemd_hash)
-        data[signature_offset:signature_offset+128] = forged_signature
+        if not skip_signature:
+            forged_signature = forge_bleichenbacher_signature(ripemd_hash)
+            data[signature_offset:signature_offset+128] = forged_signature
 
         # Solve for dCSAdjust value using GF(2) matrix algebra (instant!)
         patch_value = solve_crc32_patch_matrix(
@@ -1417,12 +1483,13 @@ class MEDC17BinaryParser:
         else:
             return False
 
-    def correct_all_checksums(self, output_path: Optional[str] = None) -> int:
+    def correct_all_checksums(self, output_path: Optional[str] = None, skip_signature: bool = False) -> int:
         """
         Correct all invalid checksums in the binary.
 
         Args:
             output_path: Path to write corrected binary. If None, overwrites original.
+            skip_signature: If True, skip forging the Bleichenbacher signature for CRC32 checksums.
 
         Returns:
             Number of checksums corrected
@@ -1511,7 +1578,7 @@ class MEDC17BinaryParser:
 
                 success = self.correct_crc32_checksum(cs, block.block_start,
                                                       block.bin_start, block.bin_end,
-                                                      corrected_data)
+                                                      corrected_data, skip_signature)
 
                 if success:
                     corrected_count += 1
@@ -1592,6 +1659,7 @@ class MEDC17BinaryParser:
             info_table.add_row("Memory", f"0x{block.block_start:08X} - 0x{block.block_end:08X}")
             info_table.add_row("Size", f"0x{block.size:X} ({block.size:,} bytes)")
             info_table.add_row("Identifier", f"0x{block.block_identifier:08X} (type: 0x{block.block_type_id:02X})")
+            info_table.add_row("SW Identifier", f"{block.sw_identifier.decode('ascii', errors='ignore')}")
 
             console.print(info_table)
 
@@ -1676,6 +1744,8 @@ Examples:
     parser_args.add_argument('binary_file', help='Input binary file to analyze')
     parser_args.add_argument('--correct', '-c', action='store_true',
                            help='Correct invalid checksums')
+    parser_args.add_argument('--skip-signature', '-s', action='store_true',
+                           help='Skip signature during correction')
     parser_args.add_argument('--output', '-o', metavar='FILE',
                            help='Output file for corrected binary')
     parser_args.add_argument('--overwrite', action='store_true',
@@ -1758,7 +1828,7 @@ Examples:
                 # Now correct checksums (handles both --correct and --fix-cvn cases)
                 # CVN patch is within checksum range, so checksums need recalculating
                 parser.data = bytes(corrected_data)
-                parser.correct_all_checksums(output_path)
+                parser.correct_all_checksums(output_path, skip_signature=args.skip_signature)
 
                 # Reload the corrected data
                 with open(output_path, 'rb') as f:
