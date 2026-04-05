@@ -633,60 +633,53 @@ class MEDC17BinaryParser:
 
     def identify_ecu_variant(self) -> List[str]:
         """
-        Identify ECU variant by reading variant string from Dataset block. (This could probably be done a smarter way)
-
-        The Dataset #0 block (ID 0x60) contains variant information at offset 0x78.
-        Format: slash-separated fields, one contains the ECU variant (e.g., "EDC17_C46")
-        Example: "34/1/EDC17_C46/5/P643//C643X5L8///"
+        Identify ECU variant by reading variant string from Dataset #0 block (ID 0x60).
+        Format: slash-separated fields, e.g. "34/1/EDC17_C46/5/P643//C643X5L8///"
         """
-        # Look for Dataset #0 block (ID 0x60)
         dataset_block = None
         for block in self.bosch_blocks:
             if block.block_identifier == 0x60:
                 dataset_block = block
                 break
-
         if not dataset_block:
             return ["Unknown (no Dataset block found)"]
 
-        # Read variant string at offset 0x78 from block start
-        variant_offset = dataset_block.bin_start + 0x78
+        block_start = dataset_block.bin_start
+        block_end = dataset_block.bin_end
+        keywords = ('MED17', 'EDC17', 'MEDC17')
 
-        if variant_offset + 100 > len(self.data):  # Safety check
-            return ["Unknown (offset out of range)"]
+        # Try known offsets first: header+0x78 (EDC17), block_end-0xF7 (MED17.3.5)
+        try_offsets = [block_start + 0x78, block_end - 0xF7]
+        for offset in try_offsets:
+            if offset < block_start or offset + 100 > len(self.data):
+                continue
+            raw = self.data[offset:offset+100]
+            null_pos = raw.find(b'\x00')
+            if null_pos != -1:
+                raw = raw[:null_pos]
+            s = raw.decode('ascii', errors='ignore')
+            if '/' in s and any(k in s for k in keywords):
+                non_empty = [f for f in s.split('/') if f.strip()]
+                ecu = next((f for f in non_empty if any(k in f for k in keywords)), None)
+                label = f"{ecu} [{'/'.join(non_empty)}]" if ecu else '/'.join(non_empty)
+                if offset != try_offsets[0]:
+                    mem_addr = dataset_block.block_start + (offset - block_start)
+                    label += f" (found at 0x{mem_addr:08X})"
+                return [label]
 
-        # Read up to 100 bytes or until null terminator
-        variant_data = self.data[variant_offset:variant_offset+100]
+        # Fallback: scan block for pattern ending with ///
+        import re
+        search_data = self.data[block_start:block_end+1]
+        for match in re.finditer(rb'[\x20-\x7E]{2,80}///\x00', search_data):
+            s = match.group()[:-1].decode('ascii', errors='ignore')
+            if any(k in s for k in keywords):
+                non_empty = [f for f in s.split('/') if f.strip()]
+                ecu = next((f for f in non_empty if any(k in f for k in keywords)), None)
+                mem_addr = dataset_block.block_start + match.start()
+                label = f"{ecu} [{'/'.join(non_empty)}]" if ecu else '/'.join(non_empty)
+                return [label + f" (found at 0x{mem_addr:08X}, search)"]
 
-        # Find null terminator or end
-        null_pos = variant_data.find(b'\x00')
-        if null_pos != -1:
-            variant_data = variant_data[:null_pos]
-
-        try:
-            variant_string = variant_data.decode('ascii', errors='ignore')
-        except:
-            return ["Unknown (decode error)"]
-
-        # Split by slashes and find the field containing MED17 or EDC17
-        fields = variant_string.split('/')
-
-        ecu_variant = None
-        for field in fields:
-            field = field.strip()
-            if 'MED17' in field or 'EDC17' in field or 'MEDC17' in field:
-                ecu_variant = field
-                break
-
-        if ecu_variant:
-            return [ecu_variant]
-        else:
-            # Fallback: show all non-empty fields
-            non_empty = [f for f in fields if f.strip()]
-            if non_empty:
-                return [f"Unknown variant (fields: {', '.join(non_empty[:3])})"]
-            else:
-                return ["Unknown"]
+        return ["Unknown"]
 
     def calculate_crc32_algo(self, start: int, end_inclusive: int, initial_value: int) -> int:
         """
@@ -808,10 +801,20 @@ class MEDC17BinaryParser:
         Returns:
             True if checksum is valid, False otherwise
         """
-        # Convert memory addresses to binary file offsets
-        # Translation: file_offset = memory_address - block_start_mem + block_start_bin
+        # Convert memory addresses to binary file offsets.
+        # First try the owning block's base. If the range falls outside (cross-bank
+        # checksum, e.g. 0x808xxxxx referenced from a 0x800xxxxx block), find the
+        # correct block that contains the range.
         start_offset = cs.cs_start - block_start_mem + block_start_bin
         end_offset = cs.cs_end - block_start_mem + block_start_bin
+
+        if start_offset < 0 or end_offset > len(self.data) or start_offset >= end_offset:
+            # Try to resolve via any block whose memory range covers cs.cs_start
+            for blk in self.bosch_blocks:
+                if blk.block_start <= cs.cs_start <= blk.block_end:
+                    start_offset = cs.cs_start - blk.block_start + blk.bin_start
+                    end_offset = cs.cs_end - blk.block_start + blk.bin_start
+                    break
 
         # Validate offsets are within binary
         if start_offset < 0 or end_offset > len(self.data) or start_offset >= end_offset:
