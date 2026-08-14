@@ -179,6 +179,44 @@ BLOCK_IDENTIFIERS = {
 }
 
 
+# MED17/EDC17 block signature ------------------------------------------------
+# Every Bosch checksum block carries, as the seed/expected value of its first
+# 32-byte checksum structure, the canonical magic pair FADECAFE / CAFEAFFE.
+# For the first structure these sit at a fixed distance from the block start:
+#   block_start + 0x34 = first checksum structure
+#                +0x0C = seed      -> 0xFADECAFE at block_start + 64
+#                +0x10 = expected  -> 0xCAFEAFFE at block_start + 68
+# The 8-byte pair is a near-unique anchor (1 in 2^64), so we locate blocks by
+# searching for it directly instead of walking the image byte by byte.
+MEDC17_MAGIC_A = 0xFADECAFE           # checksum seed   (block_start + 64)
+MEDC17_MAGIC_B = 0xCAFEAFFE           # expected value  (block_start + 68)
+MEDC17_MAGIC_PAIR = struct.pack('<II', MEDC17_MAGIC_A, MEDC17_MAGIC_B)
+MEDC17_MAGIC_OFFSET = 64              # distance from block start to magic word A
+# Block class byte (block_start + 15, the high byte of the block-end address):
+#   0x80 = application (cached flash view)  0xA0 = data/calibration (uncached)
+MEDC17_BLOCK_CLASSES = (0x80, 0xA0)
+
+# "Not programmed" fill words. A finalised block stores computed checksum/adjust
+# values; a reserved or never-programmed partition leaves them as a repeating
+# fill byte instead (0xFF on plain NOR flash, 0xAF in some Bosch images). A block
+# whose checksum AND adjust are one of these was never checksummed at the factory
+# — there is nothing real to protect, so correction must leave it untouched.
+MEDC17_BLANK_WORDS = (0xFFFFFFFF, 0xAFAFAFAF)
+
+# TriCore maps the same physical program/data flash into two aliased segment
+# views — cached 0x8xxxxxxx and uncached 0xAxxxxxxx. A block may express its
+# addresses in either view, so the segment nibble must be stripped before an
+# address is turned into a file offset; otherwise a 0xA0 (data/cal) block is
+# mis-mapped by 0x20000000 and every calculation for it lands on the wrong bytes.
+FLASH_SEGMENT_MASK = 0x0FFFFFFF          # offset within the 256 MB flash segment
+
+
+def flash_canonical(mem_addr: int) -> int:
+    """Canonical (cached-segment) form of a TriCore flash address, so the 0x80
+    and 0xA0 aliases of the same physical byte compare and translate identically."""
+    return (mem_addr & FLASH_SEGMENT_MASK) | 0x80000000
+
+
 def cube_root_int(n):
     """Calculate integer cube root using Newton's method."""
     if n == 0:
@@ -426,6 +464,17 @@ class BoschBlock:
         """Check if this block has OTP (One-Time Programmable) flag set"""
         return bool(self.block_identifier & 0x00800000)
 
+    @property
+    def is_unprogrammed(self) -> bool:
+        """Reserved/never-finalised partition: its stored checksum and adjust are
+        both blank fill (see MEDC17_BLANK_WORDS). Such a block has no real content
+        to protect — e.g. an unused second application slot filled with a single
+        pad byte — so its checksum was never computed and must be left untouched
+        during correction rather than fabricated.
+        """
+        return (self.checksum in MEDC17_BLANK_WORDS and
+                self.checksum_adjust in MEDC17_BLANK_WORDS)
+
 
 class MEDC17BinaryParser:
     """Parser for MEDC17 ECU binary files (little-endian format)"""
@@ -467,13 +516,6 @@ class MEDC17BinaryParser:
         if offset >= len(self.data):
             return 0
         return self.data[offset]
-
-    def find_next_nonzero(self, start: int) -> Optional[int]:
-        """Find next non-zero byte starting from offset"""
-        for i in range(start, len(self.data)):
-            if self.data[i] != 0:
-                return i
-        return None
 
     def read_checksum_structures(self, offset: int, count: int) -> List[ChecksumStructure]:
         """Read checksum structures (32 bytes each)"""
@@ -592,42 +634,66 @@ class MEDC17BinaryParser:
             checksum_structures=checksum_structures,
         )
 
+    def _has_block_signature(self, hdr: int) -> bool:
+        """Confirm a magic-pair hit is a real block start.
+
+        Validates the fixed fields of the 72-byte MED17 block descriptor, which
+        cheaply rejects the interior checksum structures (whose seed/expected
+        values are the same magic pair) and coincidental data matches:
+          +0x00  block_type   a known identifier
+          +0x01  reserved     0x00
+          +0x03  reserved     0x00
+          +0x0F  block_class  0x80 (application) or 0xA0 (data/cal)
+        The magic pair at +0x40/+0x44 is already guaranteed by the caller.
+        """
+        if hdr < 0 or hdr + 72 > len(self.data):
+            return False
+        d = self.data
+        return (d[hdr] in BLOCK_IDENTIFIERS and
+                d[hdr + 1] == 0x00 and d[hdr + 3] == 0x00 and
+                d[hdr + 15] in MEDC17_BLOCK_CLASSES)
+
     def find_bosch_blocks(self) -> None:
-        """Find all Bosch blocks by scanning for non-zero bytes after padding"""
+        """Locate all Bosch checksum blocks via their FADECAFE/CAFEAFFE signature.
+
+        Instead of walking the image byte by byte, jump straight to every
+        occurrence of the 8-byte magic pair (a fast C-level substring search),
+        back off 64 bytes to the block start, confirm the fixed header
+        descriptor, then fully parse and validate the block. Each block is
+        located independently, so a malformed or unusual block can never hide
+        the ones that follow it.
+        """
         print("\n[*] Scanning for Bosch checksum blocks...")
 
         # Clear existing blocks before re-scanning
         self.bosch_blocks = []
 
-        # Find first block (first non-zero byte)
-        current_pos = self.find_next_nonzero(0)
-        if current_pos is None:
-            print("[!] No blocks found (file is all zeros)")
-            return
-
-        block_count = 0
-
-        while current_pos is not None and current_pos < len(self.data):
-            block = self.parse_block(current_pos)
-
-            if block is None:
-                # Not a valid block - silently skip to next non-zero region
-                next_pos = self.find_next_nonzero(current_pos + 1)
-                if next_pos is None or next_pos >= len(self.data):
-                    break
-                current_pos = next_pos
-                continue
-
-            print(f"[+] Found block {block_count + 1} at 0x{current_pos:X}: {block.block_name}")
-            self.bosch_blocks.append(block)
-            block_count += 1
-
-            # Find next block after this one
-            next_pos = self.find_next_nonzero(block.bin_end + 1)
-            if next_pos is None or next_pos >= len(self.data):
+        data = self.data
+        search = 0
+        while True:
+            pos = data.find(MEDC17_MAGIC_PAIR, search)
+            if pos < 0:
                 break
+            search = pos + 1                        # keep overlapping matches
+            hdr = pos - MEDC17_MAGIC_OFFSET         # candidate block start
 
-            current_pos = next_pos
+            if not self._has_block_signature(hdr):
+                continue                            # interior CS or coincidence
+
+            block = self.parse_block(hdr)
+            if block is None:
+                continue                            # header ok but structure invalid
+
+            self.bosch_blocks.append(block)
+            print(f"[+] Found block {len(self.bosch_blocks)} at 0x{hdr:X}: {block.block_name}")
+
+        # bytes.find scans left-to-right, so blocks are already in offset order;
+        # sort defensively in case that ever changes.
+        self.bosch_blocks.sort(key=lambda b: b.bin_start)
+
+        if not self.bosch_blocks:
+            print("[!] No Bosch checksum blocks found")
+            return
 
         print(f"[+] Total Bosch blocks found: {len(self.bosch_blocks)}")
 
@@ -795,6 +861,17 @@ class MEDC17BinaryParser:
 
         return checksum
 
+    def _mem_to_file(self, mem_addr: int, block_start_mem: int, block_start_bin: int) -> int:
+        """Translate a flash memory address to a file offset relative to a block.
+
+        Treats the cached (0x8) and uncached (0xA) segment aliases as the same
+        physical flash, so the base is correct whether the block — and the
+        address being translated — is expressed in the 0x80 or 0xA0 view.
+        """
+        return (flash_canonical(mem_addr)
+                - flash_canonical(block_start_mem)
+                + block_start_bin)
+
     def validate_checksum_structure(self, cs: ChecksumStructure, block_start_mem: int,
                                      block_start_bin: int) -> bool:
         """
@@ -808,10 +885,10 @@ class MEDC17BinaryParser:
         Returns:
             True if checksum is valid, False otherwise
         """
-        # Convert memory addresses to binary file offsets
-        # Translation: file_offset = memory_address - block_start_mem + block_start_bin
-        start_offset = cs.cs_start - block_start_mem + block_start_bin
-        end_offset = cs.cs_end - block_start_mem + block_start_bin
+        # Convert memory addresses to binary file offsets (segment-agnostic:
+        # a 0xA0 block resolves against its own 0xA0 base, not the 0x80 view).
+        start_offset = self._mem_to_file(cs.cs_start, block_start_mem, block_start_bin)
+        end_offset = self._mem_to_file(cs.cs_end, block_start_mem, block_start_bin)
 
         # Validate offsets are within binary
         if start_offset < 0 or end_offset > len(self.data) or start_offset >= end_offset:
@@ -853,16 +930,30 @@ class MEDC17BinaryParser:
             for cs in block.checksum_structures:
                 self.validate_checksum_structure(cs, block.block_start, block.bin_start)
 
-        # Count validation results
+        # Count validation results. Reserved/unprogrammed partitions have no
+        # finalised checksum, so exclude them from the pass/fail tally instead of
+        # counting them as failures.
         total = sum(len(block.checksum_structures) for block in self.bosch_blocks)
+        reserved = sum(len(block.checksum_structures) for block in self.bosch_blocks
+                       if block.is_unprogrammed)
         valid = sum(1 for block in self.bosch_blocks
                    for cs in block.checksum_structures if cs.is_valid)
 
-        print(f"[+] Validated {valid}/{total} checksums")
+        if reserved:
+            print(f"[+] Validated {valid}/{total - reserved} checksums "
+                  f"({reserved} reserved/unprogrammed skipped)")
+        else:
+            print(f"[+] Validated {valid}/{total} checksums")
 
     def _is_flash_addr(self, addr: int) -> bool:
-        """Check if address is a valid TriCore flash address."""
-        return 0x80000000 <= addr <= 0x8FFFFFFF
+        """Check if address is a valid TriCore flash address.
+
+        Accepts both the cached (0x8xxxxxxx) and uncached (0xAxxxxxxx) views of
+        program/data flash. The 0xA0 segment aliases the same physical flash and
+        is used by data/calibration blocks (block_class 0xA0).
+        """
+        return (0x80000000 <= addr <= 0x8FFFFFFF or
+                0xA0000000 <= addr <= 0xAFFFFFFF)
 
     def find_cvn_config(self) -> Optional[CVNConfig]:
         """
@@ -886,7 +977,9 @@ class MEDC17BinaryParser:
 
         ds_start = ds_block.block_start
         ds_end = ds_block.block_end
-        base = self.bosch_blocks[0].block_start - self.bosch_blocks[0].bin_start
+        # Canonical base: reduce the first block's start to the cached-segment
+        # view so pointers/regions in either segment translate against one base.
+        base = flash_canonical(self.bosch_blocks[0].block_start) - self.bosch_blocks[0].bin_start
 
         # Search for CVN config pattern:
         # { pointer, DS_START, DS_WOCS_END, count }
@@ -902,34 +995,37 @@ class MEDC17BinaryParser:
                 self._is_flash_addr(val2) and ds_start < val2 <= ds_end and
                 1 <= count <= 4):
 
-                # Follow pointer to get memory section table
-                config_offset = ptr - base
+                # Follow pointer to get memory section table. Canonicalise flash
+                # addresses so a 0xA0 pointer resolves against the same base.
+                config_offset = flash_canonical(ptr) - base
                 if not (0 <= config_offset < len(self.data)):
                     continue
 
                 memsec_ptr = self.read_dword_le(config_offset)
-                memsec_offset = memsec_ptr - base
+                memsec_offset = flash_canonical(memsec_ptr) - base
                 if not (0 <= memsec_offset < len(self.data)):
                     continue
 
-                # Read memory section entries (start, end pairs)
+                # Read memory section entries (start, end pairs). Store them in
+                # canonical form so every downstream `addr - base` is correct
+                # regardless of which segment the firmware used.
                 regions = []
                 for i in range(4):  # Max 4 sections
                     sec_start = self.read_dword_le(memsec_offset + i * 8)
                     sec_end = self.read_dword_le(memsec_offset + i * 8 + 4)
                     if self._is_flash_addr(sec_start) and self._is_flash_addr(sec_end) and sec_end > sec_start:
-                        regions.append((sec_start, sec_end))
+                        regions.append((flash_canonical(sec_start), flash_canonical(sec_end)))
                     else:
                         break
 
                 # Add dataset region
-                regions.append((val1, val2))
+                regions.append((flash_canonical(val1), flash_canonical(val2)))
 
                 return CVNConfig(
                     config_offset=offset,
                     regions=regions,
-                    ds_start=val1,
-                    ds_wocs_end=val2,
+                    ds_start=flash_canonical(val1),
+                    ds_wocs_end=flash_canonical(val2),
                     base_address=base
                 )
 
@@ -1261,8 +1357,8 @@ class MEDC17BinaryParser:
             return False
 
         # Convert memory addresses to binary file offsets
-        start_offset = cs.cs_start - block_start_mem + block_start_bin
-        end_offset = cs.cs_end - block_start_mem + block_start_bin
+        start_offset = self._mem_to_file(cs.cs_start, block_start_mem, block_start_bin)
+        end_offset = self._mem_to_file(cs.cs_end, block_start_mem, block_start_bin)
 
         if start_offset < 0 or end_offset > len(data) or start_offset >= end_offset:
             return False
@@ -1308,8 +1404,8 @@ class MEDC17BinaryParser:
             return False
 
         # Convert memory addresses to binary file offsets
-        start_offset = cs.cs_start - block_start_mem + block_start_bin
-        end_offset = cs.cs_end - block_start_mem + block_start_bin
+        start_offset = self._mem_to_file(cs.cs_start, block_start_mem, block_start_bin)
+        end_offset = self._mem_to_file(cs.cs_end, block_start_mem, block_start_bin)
 
         if start_offset < 0 or end_offset > len(data) or start_offset >= end_offset:
             return False
@@ -1365,8 +1461,8 @@ class MEDC17BinaryParser:
             return False
 
         # Convert memory addresses to binary file offsets
-        start_offset = cs.cs_start - block_start_mem + block_start_bin
-        end_offset = cs.cs_end - block_start_mem + block_start_bin
+        start_offset = self._mem_to_file(cs.cs_start, block_start_mem, block_start_bin)
+        end_offset = self._mem_to_file(cs.cs_end, block_start_mem, block_start_bin)
 
         if start_offset < 0 or end_offset > len(data) or start_offset >= end_offset:
             return False
@@ -1436,12 +1532,22 @@ class MEDC17BinaryParser:
         corrected_data = bytearray(self.data)
         corrected_count = 0
 
+        # Reserved / never-programmed partitions (blank checksum fields) are not
+        # real firmware — correcting them would fabricate a checksum for empty
+        # space and mutate an otherwise-original image, so leave them untouched.
+        for block in self.bosch_blocks:
+            if block.is_unprogrammed:
+                print_info(f"{block.block_name}: unprogrammed/reserved "
+                           f"(checksum fields are 0x{block.checksum:08X} fill) — left unchanged")
+
         # PASS 1: Correct all ADD32 and ADD16 checksums first
         console.print()
         console.print("[bold blue]PASS 1:[/bold blue] Correcting ADD32 and ADD16 checksums")
         console.print()
 
         for i, block in enumerate(self.bosch_blocks, 1):
+            if block.is_unprogrammed:
+                continue
             has_add = any(cs.cs_algorithm in (0x01, 0x10) for cs in block.checksum_structures)
             if not has_add:
                 continue
@@ -1489,6 +1595,8 @@ class MEDC17BinaryParser:
         console.print()
 
         for i, block in enumerate(self.bosch_blocks, 1):
+            if block.is_unprogrammed:
+                continue
             has_crc32 = any(cs.cs_algorithm == 0x00 for cs in block.checksum_structures)
             if not has_crc32:
                 continue
@@ -1578,9 +1686,11 @@ class MEDC17BinaryParser:
         for i, block in enumerate(self.bosch_blocks, 1):
             console.print()
 
-            # Block header with OTP indicator if set
+            # Block header with OTP / reserved indicators if set
             otp_indicator = " [red][OTP][/red]" if block.has_otp else ""
-            header = f"[bold yellow]Block {i}:[/bold yellow] [cyan]{block.block_name}[/cyan]{otp_indicator}"
+            reserved_indicator = " [yellow][RESERVED][/yellow]" if block.is_unprogrammed else ""
+            header = (f"[bold yellow]Block {i}:[/bold yellow] [cyan]{block.block_name}[/cyan]"
+                      f"{otp_indicator}{reserved_indicator}")
             console.print(header)
 
             # Block info table
@@ -1606,13 +1716,19 @@ class MEDC17BinaryParser:
                 cs_table.add_column("Range", width=25)
                 cs_table.add_column("Calculated", width=10, justify="right")
                 cs_table.add_column("Expected", width=10, justify="right")
-                cs_table.add_column("Status", width=8, justify="center")
+                cs_table.add_column("Status", width=10, justify="center")
 
                 for j, cs in enumerate(block.checksum_structures, 1):
                     algo_name = {0x00: "CRC32", 0x01: "ADD32", 0x10: "ADD16"}.get(cs.cs_algorithm, "UNKNOWN")
                     range_str = f"0x{cs.cs_start:08X}\n0x{cs.cs_end:08X}"
 
-                    if cs.calculated_checksum is not None:
+                    if block.is_unprogrammed:
+                        # Reserved/never-programmed partition: no finalised
+                        # checksum to compare against, so don't flag it as failed.
+                        calc_str = f"0x{cs.calculated_checksum:08X}" if cs.calculated_checksum is not None else "-"
+                        exp_str = "-"
+                        status = Text("⊘ RESERVED", style="yellow")
+                    elif cs.calculated_checksum is not None:
                         calc_str = f"0x{cs.calculated_checksum:08X}"
                         exp_str = "0x35015001" if cs.cs_algorithm == 0x00 else "0xCAFEAFFE"
 
