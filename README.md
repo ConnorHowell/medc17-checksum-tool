@@ -62,12 +62,18 @@ python main.py firmware.bin --correct --output firmware_corrected.bin
 python main.py modified.bin --correct --fix-cvn original.bin --output fixed.bin
 ```
 
+### Correct checksums and preserve CVN without the original file
+```bash
+python main.py modified.bin --correct --fix-cvn-inplace --output fixed.bin
+```
+
 ### Options
 ```
   -h, --help            Show help
   -c, --correct         Correct invalid checksums
   -o OUTPUT, --output   Output file path for corrected binary
   --fix-cvn ORIGINAL    Fix CVN to match the CVN from ORIGINAL file
+  --fix-cvn-inplace     Preserve CVN without the original file (best effort)
 ```
 
 ## How It Works

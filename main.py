@@ -84,6 +84,67 @@ def init_crc32_table():
         CRC32_TABLE.append(crc)
 
 
+# Reverse CRC32 table (mirrors the DLL table at DAT_1802515a0). Indexed by the
+# top byte of the running register, it walks a CRC32 *backwards* from the end of
+# a region toward a hole: rev[fwd[j] >> 24] = (fwd[j] << 8) ^ j.
+CRC32_REVERSE_TABLE = None
+
+def init_crc32_reverse_table():
+    """Initialize the reverse CRC32 table used by the forward/reverse solver."""
+    global CRC32_REVERSE_TABLE
+    if CRC32_REVERSE_TABLE is not None:
+        return
+    init_crc32_table()
+    rev = [0] * 256
+    for j in range(256):
+        fwd = CRC32_TABLE[j]
+        rev[fwd >> 24] = ((fwd << 8) & 0xFFFFFFFF) ^ j
+    CRC32_REVERSE_TABLE = rev
+
+
+def crc32_fold_patch(data, region_start: int, region_end_incl: int, hole: int,
+                     init: int = 0xFFFFFFFF, target: int = 0,
+                     xorout: int = 0xFFFFFFFF) -> int:
+    """Solve the 4 bytes at `hole` so CRC32 over [region_start, region_end_incl]
+    equals `target` (a port of the DLL solver FUN_180010370).
+
+    CRC32 here is the standard reflected variant (poly 0xEDB88320) with the given
+    init/xorout — for init=xorout=0xFFFFFFFF this is plain zlib.crc32. The solver
+    runs the CRC forward from the region start to the hole, runs it backward from
+    the region end to the far side of the hole via the reverse table, then folds
+    the two register states into the dword that forces the whole-region CRC to
+    `target`. Returned as an int to store little-endian at `hole`.
+    """
+    init_crc32_reverse_table()
+    fwd_tbl = CRC32_TABLE
+    rev_tbl = CRC32_REVERSE_TABLE
+
+    # Forward CRC register at the near edge of the hole.
+    f = init & 0xFFFFFFFF
+    for pos in range(region_start, hole):
+        f = (f >> 8) ^ fwd_tbl[(data[pos] ^ f) & 0xFF]
+
+    # Backward CRC register from the region end down to the far edge of the hole.
+    u = (target ^ xorout) & 0xFFFFFFFF
+    pos = region_end_incl
+    while hole + 4 <= pos:
+        u = (data[pos] ^ rev_tbl[u >> 24] ^ ((u << 8) & 0xFFFFFFFF)) & 0xFFFFFFFF
+        pos -= 1
+
+    # Fold the forward register into the backward register, byte by byte, to
+    # recover the 4 hole bytes.
+    u = ((u << 8) & 0xFFFFFFFF) ^ rev_tbl[u >> 24]
+    u = (((f >> 16) & 0xFF) ^ rev_tbl[u >> 24] ^ (((u ^ (f >> 24)) << 8) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    u = (((f >> 8) & 0xFF) ^ rev_tbl[u >> 24] ^ ((u << 8) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    return (((u << 8) & 0xFFFFFFFF) ^ rev_tbl[u >> 24] ^ (f & 0xFF)) & 0xFFFFFFFF
+
+
+# Erased/free dword fills seen in flash: NOR-erased 0xFF, zeroed, or the Bosch
+# 0xC3 pad. A dword matching one of these can be overwritten with a compensation
+# value without clobbering live calibration data.
+ERASED_DWORDS = (0x00000000, 0xFFFFFFFF, 0xC3C3C3C3)
+
+
 def reverse_bits_32(n):
     """Reverse all 32 bits of an integer"""
     result = 0
@@ -1081,6 +1142,41 @@ class MEDC17BinaryParser:
 
         return crc ^ 0xFFFFFFFF
 
+    def _dataset_comptest_bounds(self):
+        """File offsets describing the dataset CompTest region.
+
+        The dataset region (last CVN region) is the block the ECU CompTest CRC
+        covers, and its stored CRC sits in the 4 bytes immediately after it.
+        Returns (region_start, region_end_incl, blk_end) as file offsets, where
+        the CompTest region is [region_start, region_end_incl] and its stored CRC
+        occupies [blk_end-3, blk_end]. Returns None if there is no CVN config.
+        """
+        if self.cvn_config is None:
+            return None
+        base = self.cvn_config.base_address
+        region_start = self.cvn_config.ds_start - base
+        region_end_incl = self.cvn_config.ds_wocs_end - base
+        blk_end = region_end_incl + 4
+        return region_start, region_end_incl, blk_end
+
+    def find_erased_slot(self, data, blk_end: int, region_start: int) -> Optional[int]:
+        """Find a free/erased dword to host a compensation value.
+
+        Mirrors the DLL scan (FUN_180011fd0): starting one paragraph below the
+        stored CRC — (blk_end & ~0xF) - 0x10 — walk backward a dword at a time
+        and return the first slot whose current value is an erased fill. Bounded
+        below by region_start so we never leave the checksummed region. Returns
+        the file offset, or None if no erased slot exists.
+        """
+        off = (blk_end & 0xFFFFFFF0) - 0x10
+        while off > region_start:
+            if off + 4 <= len(data):
+                value = struct.unpack('<I', data[off:off + 4])[0]
+                if value in ERASED_DWORDS:
+                    return off
+            off -= 4
+        return None
+
     def correct_cvn(self, target_cvn: int, data: bytearray) -> bool:
         """
         Correct CVN to match a target value by patching the dataset region.
@@ -1088,7 +1184,8 @@ class MEDC17BinaryParser:
         Uses GF(2) matrix solving to find a 4-byte patch value that makes
         the CVN CRC32 equal the target value.
 
-        The patch location is: DS_WOCS_END aligned down to 32-byte boundary
+        The patch is written to a free/erased slot inside the dataset region so
+        live calibration data is never overwritten.
 
         Args:
             target_cvn: Target CVN value to achieve
@@ -1100,13 +1197,17 @@ class MEDC17BinaryParser:
         if self.cvn_config is None:
             return False
 
-        base = self.cvn_config.base_address
-        ds_wocs_end_file = self.cvn_config.ds_wocs_end - base
+        region_start, _region_end_incl, blk_end = self._dataset_comptest_bounds()
 
-        # Patch location: DS_WOCS_END aligned down to 32-byte boundary
-        patch_offset = ds_wocs_end_file & ~0x1F
+        # Patch an erased slot rather than DS_WOCS_END & ~0x1F, which could land
+        # on live calibration data.
+        patch_offset = self.find_erased_slot(data, blk_end, region_start)
+        if patch_offset is None:
+            print_error("No erased slot found in dataset region for CVN patch")
+            return False
 
         # Verify patch is within a CVN region
+        base = self.cvn_config.base_address
         patch_in_region = False
         for mem_start, mem_end in self.cvn_config.regions:
             file_start = mem_start - base
@@ -1121,6 +1222,76 @@ class MEDC17BinaryParser:
 
         # Use multi-region solver which handles all cases correctly
         return self._correct_cvn_multiregion(target_cvn, data, patch_offset)
+
+    def correct_cvn_best_effort(self, data: bytearray) -> bool:
+        """Preserve the CVN without the original file.
+
+        The ECU stores a CompTest CRC over the dataset block (the same block the
+        CVN covers); it lives in the 4 bytes right after the dataset region. We
+        solve a compensation dword at a free/erased slot so that CompTest CRC
+        returns to its stored value. Because CVN and CompTest are both CRC32 over
+        the same region and CRC32 is affine, restoring CompTest to the value it
+        held for the untuned calibration restores the CVN to that same untuned
+        value as a side effect — no original binary required.
+
+        This is best effort: it assumes the stored CompTest CRC still reflects
+        the original calibration (i.e. it was not itself overwritten by the tune).
+
+        Args:
+            data: Mutable binary data (bytearray)
+
+        Returns:
+            True if the CompTest CRC now matches its stored value, else False
+        """
+        if self.cvn_config is None:
+            print_error("No CVN configuration found")
+            return False
+
+        region_start, region_end_incl, blk_end = self._dataset_comptest_bounds()
+
+        # Stored CompTest CRC: the dword immediately after the dataset region.
+        if blk_end + 1 > len(data):
+            print_error("Dataset CompTest CRC lies outside the binary")
+            return False
+        stored_crc = struct.unpack('<I', data[blk_end - 3:blk_end + 1])[0]
+        print_info(f"Stored CompTest CRC: 0x{stored_crc:08X}")
+
+        if stored_crc in ERASED_DWORDS:
+            print_warning("Stored CompTest CRC looks blank/erased — "
+                          "this dataset may not carry a CompTest checksum")
+
+        current_crc = self._region_crc32(data, region_start, region_end_incl)
+        print_info(f"Current CompTest CRC: 0x{current_crc:08X}")
+        if current_crc == stored_crc:
+            print_success("CompTest CRC already matches — CVN already preserved")
+            return True
+
+        # Find a free slot and solve the compensation dword.
+        slot = self.find_erased_slot(data, blk_end, region_start)
+        if slot is None:
+            print_error("No erased slot found in dataset region for compensation")
+            return False
+        print_info(f"Compensation slot: 0x{slot:08X} (was 0x{struct.unpack('<I', data[slot:slot+4])[0]:08X})")
+
+        patch = crc32_fold_patch(data, region_start, region_end_incl, slot,
+                                 init=0xFFFFFFFF, target=stored_crc, xorout=0xFFFFFFFF)
+        struct.pack_into('<I', data, slot, patch)
+
+        # Verify the region CRC now equals the stored value.
+        new_crc = self._region_crc32(data, region_start, region_end_incl)
+        if new_crc == stored_crc:
+            print_success(f"CompTest CRC restored to 0x{stored_crc:08X} "
+                          f"(compensation 0x{patch:08X} @ 0x{slot:08X})")
+            return True
+
+        print_error(f"CompTest CRC still 0x{new_crc:08X}, expected 0x{stored_crc:08X}")
+        return False
+
+    @staticmethod
+    def _region_crc32(data, start: int, end_incl: int) -> int:
+        """Standard CRC32 (zlib) over an inclusive byte range — the CompTest CRC."""
+        import zlib
+        return zlib.crc32(bytes(data[start:end_incl + 1])) & 0xFFFFFFFF
 
     def _correct_cvn_multiregion(self, target_cvn: int, data: bytearray, patch_offset: int) -> bool:
         """
@@ -1786,6 +1957,9 @@ Examples:
 
   # Correct checksums AND CVN to match original file
   %(prog)s modified.bin --correct --fix-cvn original.bin -o fixed.bin
+
+  # Correct checksums AND preserve CVN without the original file
+  %(prog)s modified.bin --correct --fix-cvn-inplace -o fixed.bin
         '''
     )
 
@@ -1798,12 +1972,19 @@ Examples:
                            help='Overwrite input file with corrections (dangerous!)')
     parser_args.add_argument('--fix-cvn', metavar='ORIGINAL',
                            help='Fix CVN to match the CVN from ORIGINAL file')
+    parser_args.add_argument('--fix-cvn-inplace', action='store_true',
+                           help='Preserve CVN without the original file (best effort, '
+                                'via the stored CompTest CRC)')
 
     args = parser_args.parse_args()
 
     # Validate arguments
     if args.correct and args.overwrite and args.output:
         print_error("Cannot specify both --output and --overwrite")
+        sys.exit(1)
+
+    if args.fix_cvn and args.fix_cvn_inplace:
+        print_error("Cannot specify both --fix-cvn and --fix-cvn-inplace")
         sys.exit(1)
 
     import time
@@ -1821,7 +2002,7 @@ Examples:
             output_path = args.binary_file
 
         # Perform correction if requested
-        if args.correct or args.fix_cvn:
+        if args.correct or args.fix_cvn or args.fix_cvn_inplace:
             if not output_path:
                 console.print()
                 print_warning("Correction requested but no output path given")
@@ -1871,7 +2052,26 @@ Examples:
 
                         print_success(f"CVN patched for target 0x{target_cvn:08X}")
 
-                # Now correct checksums (handles both --correct and --fix-cvn cases)
+                # Best-effort CVN preservation without the original file.
+                if args.fix_cvn_inplace:
+                    console.print()
+                    console.print(Panel("[bold cyan]CVN Correction (best effort, no original)[/bold cyan]",
+                                      border_style="cyan"))
+
+                    parser.data = bytes(corrected_data)
+                    if parser.cvn_config is None:
+                        print_error("Could not find CVN config in input file")
+                        sys.exit(1)
+
+                    print_info(f"Current CVN: 0x{parser.calculate_cvn():08X}")
+                    success = parser.correct_cvn_best_effort(corrected_data)
+                    if not success:
+                        print_error("Best-effort CVN correction failed")
+                        sys.exit(1)
+                    parser.data = bytes(corrected_data)
+                    print_info(f"Preserved CVN: 0x{parser.calculate_cvn():08X}")
+
+                # Now correct checksums (handles --correct / --fix-cvn / --fix-cvn-inplace)
                 # CVN patch is within checksum range, so checksums need recalculating
                 parser.data = bytes(corrected_data)
                 parser.correct_all_checksums(output_path)
@@ -1890,6 +2090,23 @@ Examples:
                         print_success(f"CVN verified: 0x{new_cvn:08X}")
                     else:
                         print_error(f"CVN verification failed: got 0x{new_cvn:08X}")
+
+                # Verify the CompTest CRC (and hence the preserved CVN) survived
+                # the checksum correction.
+                if args.fix_cvn_inplace:
+                    console.print()
+                    console.print("[dim]Verifying CVN after checksum correction...[/dim]")
+                    parser.data = bytes(corrected_data)
+                    bounds = parser._dataset_comptest_bounds()
+                    r_start, r_end, blk_end = bounds
+                    stored = struct.unpack('<I', corrected_data[blk_end - 3:blk_end + 1])[0]
+                    got = parser._region_crc32(corrected_data, r_start, r_end)
+                    if got == stored:
+                        print_success(f"CompTest CRC verified: 0x{got:08X} "
+                                      f"(CVN preserved: 0x{parser.calculate_cvn():08X})")
+                    else:
+                        print_error(f"CompTest verification failed: got 0x{got:08X}, "
+                                    f"expected 0x{stored:08X}")
 
         # Print elapsed time
         elapsed = time.time() - start_time
