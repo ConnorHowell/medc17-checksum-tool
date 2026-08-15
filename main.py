@@ -652,8 +652,8 @@ class MEDC17BinaryParser:
         # Number of checksum structures at offset +0x2C (26 + 10 + 8)
         num_checksum_structures = self.read_dword_le(flat_address + 26 + identifier_length + 8)
 
-        # Validate number of checksum structures is reasonable
-        if num_checksum_structures > 100:
+        # Validate number of checksum structures (DLL accepts 1-8 only)
+        if not 1 <= num_checksum_structures <= 8:
             return None
 
         # Calculate block start from block_end and size
