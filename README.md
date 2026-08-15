@@ -62,12 +62,18 @@ python main.py firmware.bin --correct --output firmware_corrected.bin
 python main.py modified.bin --correct --fix-cvn original.bin --output fixed.bin
 ```
 
+### Correct checksums and preserve CVN without the original file
+```bash
+python main.py modified.bin --correct --fix-cvn-inplace --output fixed.bin
+```
+
 ### Options
 ```
   -h, --help            Show help
   -c, --correct         Correct invalid checksums
   -o OUTPUT, --output   Output file path for corrected binary
   --fix-cvn ORIGINAL    Fix CVN to match the CVN from ORIGINAL file
+  --fix-cvn-inplace     Preserve CVN without the original file (best effort)
 ```
 
 ## How It Works
@@ -115,9 +121,9 @@ This approach works across different MED17/EDC17 variants without requiring vari
 
 Future enhancements planned:
 
-- [ ] **Sync blocks** - WinOLS references these, what are they??
+- [ ] **Sync blocks** - referenced by some tools, what are they??
 - [ ] **ECM/Code monitoring checksums** - Make sure all monitoring checksums are corrected
-- [ ] **Variant Dataset Correction** - Even with just calibration changes WinOLS will make changes to the VDS block epilog if it exists, needs investigation
+- [ ] **Variant Dataset Correction** - Even with just calibration changes the VDS block epilog may need changes if it exists, needs investigation
 - [ ] **Extended testing** - Validation with code section modifications beyond calibration changes
 
 Contributions welcome!
@@ -133,4 +139,4 @@ Copyright (c) 2025 Connor Howell
 ## Disclaimer
 
 > [!NOTE]
-> For educational and research purposes. Use responsibly on firmware you own or have permission to modify. This implementation may not produce identical output to commercial tools like WinOLS.
+> For educational and research purposes. Use responsibly on firmware you own or have permission to modify. This implementation may not produce identical output to commercial tools.
