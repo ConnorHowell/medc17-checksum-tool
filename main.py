@@ -960,10 +960,10 @@ class MEDC17BinaryParser:
         # Calculate checksum based on algorithm
         if cs.cs_algorithm == 0x00:
             # Algorithm 0x00: CRC32 (SB_CRC32_ALGO_E)
-            # Expected result: 0x35015001 (complement of cs_expected_val)
+            # Expected result: complement of cs_expected_val
             checksum = self.calculate_crc32_algo(start_offset, end_offset, cs.cs_start_val)
             cs.calculated_checksum = checksum
-            cs.is_valid = (checksum == 0x35015001)
+            cs.is_valid = (checksum == (~cs.cs_expected_val) & 0xFFFFFFFF)
         elif cs.cs_algorithm == 0x01:
             # Algorithm 0x01: ADD32 (SB_ADD32_ALGO_E)
             # Expected result: cs_expected_val directly (0xCAFEAFFE)
@@ -1646,7 +1646,7 @@ class MEDC17BinaryParser:
         if epilog_adjust_offset < start_offset or epilog_adjust_offset + 3 > end_offset:
             return False
 
-        target_checksum = 0x35015001  # Target for CRC32
+        target_checksum = (~cs.cs_expected_val) & 0xFFFFFFFF  # complement of expected
 
         # Calculate RIPEMD-160 hash of block (excluding signature + dCSAdjust)
         hash_start = block_start_bin
@@ -1901,7 +1901,9 @@ class MEDC17BinaryParser:
                         status = Text("⊘ RESERVED", style="yellow")
                     elif cs.calculated_checksum is not None:
                         calc_str = f"0x{cs.calculated_checksum:08X}"
-                        exp_str = "0x35015001" if cs.cs_algorithm == 0x00 else "0xCAFEAFFE"
+                        exp_str = (f"0x{(~cs.cs_expected_val) & 0xFFFFFFFF:08X}"
+                                   if cs.cs_algorithm == 0x00
+                                   else f"0x{cs.cs_expected_val:08X}")
 
                         if cs.is_valid:
                             status = Text("✓ VALID", style="bold green")
