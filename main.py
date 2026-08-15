@@ -916,9 +916,9 @@ class MEDC17BinaryParser:
             pos += 2
             checksum = (checksum + word) & 0xFFFFFFFF
 
-        # Last 16-bit word goes into the high 16 bits
+        # Final 16-bit word
         word = self.data[pos] | (self.data[pos + 1] << 8)
-        checksum: int = (checksum + (word << 16)) & 0xFFFFFFFF
+        checksum = (checksum + word) & 0xFFFFFFFF
 
         return checksum
 
