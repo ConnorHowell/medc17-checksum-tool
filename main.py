@@ -84,9 +84,9 @@ def init_crc32_table():
         CRC32_TABLE.append(crc)
 
 
-# Reverse CRC32 table (mirrors the DLL table at DAT_1802515a0). Indexed by the
-# top byte of the running register, it walks a CRC32 *backwards* from the end of
-# a region toward a hole: rev[fwd[j] >> 24] = (fwd[j] << 8) ^ j.
+# Reverse CRC32 table for the reflected poly 0xEDB88320. Indexed by the top byte
+# of the running register, it walks a CRC32 *backwards* from the end of a region
+# toward a hole: rev[fwd[j] >> 24] = (fwd[j] << 8) ^ j.
 CRC32_REVERSE_TABLE = None
 
 def init_crc32_reverse_table():
@@ -106,7 +106,7 @@ def crc32_fold_patch(data, region_start: int, region_end_incl: int, hole: int,
                      init: int = 0xFFFFFFFF, target: int = 0,
                      xorout: int = 0xFFFFFFFF) -> int:
     """Solve the 4 bytes at `hole` so CRC32 over [region_start, region_end_incl]
-    equals `target` (a port of the DLL solver FUN_180010370).
+    equals `target`.
 
     CRC32 here is the standard reflected variant (poly 0xEDB88320) with the given
     init/xorout — for init=xorout=0xFFFFFFFF this is plain zlib.crc32. The solver
@@ -1088,11 +1088,11 @@ class MEDC17BinaryParser:
     def find_erased_slot(self, data, blk_end: int, region_start: int) -> Optional[int]:
         """Find a free/erased dword to host a compensation value.
 
-        Mirrors the DLL scan (FUN_180011fd0): starting one paragraph below the
-        stored CRC — (blk_end & ~0xF) - 0x10 — walk backward a dword at a time
-        and return the first slot whose current value is an erased fill. Bounded
-        below by region_start so we never leave the checksummed region. Returns
-        the file offset, or None if no erased slot exists.
+        Starting one paragraph below the stored CRC — (blk_end & ~0xF) - 0x10 —
+        walk backward a dword at a time and return the first slot whose current
+        value is an erased fill. Bounded below by region_start so we never leave
+        the checksummed region. Returns the file offset, or None if no erased
+        slot exists.
         """
         off = (blk_end & 0xFFFFFFF0) - 0x10
         while off > region_start:
