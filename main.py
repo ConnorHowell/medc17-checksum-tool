@@ -13,21 +13,83 @@ Copyright (c) 2025 Connor Howell
 Licensed under the MIT License
 """
 
+import json
+import os
+import re
 import struct
 import sys
 import hashlib
+from types import SimpleNamespace
 from typing import List, Optional
 from dataclasses import dataclass
 from pathlib import Path
 
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich import box
-from rich.text import Text
+# rich is optional: the pretty CLI report uses it, --json never does. The plain
+# stand-ins below keep every mode working with nothing but the standard library.
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich import box
+    from rich.text import Text
+except ImportError:
+    _MARKUP_RE = re.compile(r'\[/?[a-z0-9 #_=\.\-]{0,40}\]', re.IGNORECASE)
+
+    def _strip_markup(value) -> str:
+        return _MARKUP_RE.sub('', str(value))
+
+    class Console:
+        def print(self, *values, **_kwargs):
+            print(' '.join(_strip_markup(v) for v in values) if values else '')
+
+    class Panel:
+        def __init__(self, content, title=None, **_kwargs):
+            self.content = content
+            self.title = title
+
+        def __str__(self):
+            heading = f"--- {_strip_markup(self.title)} ---\n" if self.title else ''
+            return heading + _strip_markup(self.content)
+
+    class Table:
+        def __init__(self, title=None, **_kwargs):
+            self.title = title
+            self.rows = []
+
+        def add_column(self, *_args, **_kwargs):
+            pass
+
+        def add_row(self, *cells):
+            self.rows.append([_strip_markup(c).replace('\n', ' ') for c in cells])
+
+        def __str__(self):
+            lines = [f"--- {_strip_markup(self.title)} ---"] if self.title else []
+            lines.extend('  '.join(row) for row in self.rows)
+            return '\n'.join(lines)
+
+    def Text(value, style=None):
+        return _strip_markup(value)
+
+    box = SimpleNamespace(SIMPLE=None, ROUNDED=None)
+
+
+class _NullConsole:
+    """Swallows every human-readable message, so --json owns stdout."""
+
+    def print(self, *_values, **_kwargs):
+        pass
+
 
 console = Console()
+
+# --json emits one JSON document on stdout and nothing else
+QUIET = False
+
+
+def set_quiet(quiet: bool) -> None:
+    global QUIET, console
+    QUIET = quiet
+    console = _NullConsole() if quiet else Console()
 
 
 def print_banner():
@@ -182,6 +244,13 @@ def flash_canonical(mem_addr: int) -> int:
     """Cached-segment form of a flash address, so the 0x80 and 0xA0 aliases of the
     same physical byte compare and translate identically."""
     return (mem_addr & FLASH_SEGMENT_MASK) | 0x80000000
+
+
+def hex32(value: Optional[int]) -> Optional[str]:
+    """0x-prefixed 32-bit hex, or None so JSON consumers see a null."""
+    if value is None:
+        return None
+    return f"0x{value & 0xFFFFFFFF:08X}"
 
 
 def cube_root_int(n):
@@ -418,6 +487,8 @@ class MEDC17BinaryParser:
 
     CHECKSUM_STRUCTURE_SIZE = 32
 
+    ALGORITHM_NAMES = {0x00: 'CRC32', 0x01: 'ADD32', 0x10: 'ADD16'}
+
     def __init__(self, binary_path: str):
         self.binary_path = Path(binary_path)
         self.data: bytes = b''
@@ -580,7 +651,7 @@ class MEDC17BinaryParser:
         Blocks are located independently, so a malformed one can't hide those
         after it.
         """
-        print("\n[*] Scanning for Bosch checksum blocks...")
+        console.print("\n[*] Scanning for Bosch checksum blocks...")
 
         self.bosch_blocks = []
 
@@ -601,16 +672,16 @@ class MEDC17BinaryParser:
                 continue
 
             self.bosch_blocks.append(block)
-            print(f"[+] Found block {len(self.bosch_blocks)} at 0x{hdr:X}: {block.block_name}")
+            console.print(f"[+] Found block {len(self.bosch_blocks)} at 0x{hdr:X}: {block.block_name}")
 
         # find() runs left-to-right so these are already in order; sort defensively
         self.bosch_blocks.sort(key=lambda b: b.bin_start)
 
         if not self.bosch_blocks:
-            print("[!] No Bosch checksum blocks found")
+            console.print("[!] No Bosch checksum blocks found")
             return
 
-        print(f"[+] Total Bosch blocks found: {len(self.bosch_blocks)}")
+        console.print(f"[+] Total Bosch blocks found: {len(self.bosch_blocks)}")
 
     def identify_ecu_variant(self) -> List[str]:
         """ECU variant string from the Dataset #0 block. (This could probably be done a smarter way)
@@ -769,25 +840,49 @@ class MEDC17BinaryParser:
         return cs.is_valid if cs.is_valid is not None else False
 
     def validate_all_checksums(self) -> None:
-        print("\n[*] Validating checksums...")
+        console.print("\n[*] Validating checksums...")
 
         for block in self.bosch_blocks:
             for cs in block.checksum_structures:
                 self.validate_checksum_structure(cs, block.block_start, block.bin_start)
 
-        # Reserved partitions have no finalised checksum — keep them out of the
-        # tally rather than counting them as failures
-        total = sum(len(block.checksum_structures) for block in self.bosch_blocks)
-        reserved = sum(len(block.checksum_structures) for block in self.bosch_blocks
-                       if block.is_unprogrammed)
-        valid = sum(1 for block in self.bosch_blocks
-                   for cs in block.checksum_structures if cs.is_valid)
+        counts = self.checksum_counts()
 
-        if reserved:
-            print(f"[+] Validated {valid}/{total - reserved} checksums "
-                  f"({reserved} reserved/unprogrammed skipped)")
+        if counts['reserved_checksums']:
+            console.print(f"[+] Validated {counts['valid_checksums']}/{counts['checkable_checksums']} "
+                          f"checksums ({counts['reserved_checksums']} reserved/unprogrammed skipped)")
         else:
-            print(f"[+] Validated {valid}/{total} checksums")
+            console.print(f"[+] Validated {counts['valid_checksums']}/{counts['total_checksums']} checksums")
+
+    def checksum_counts(self) -> dict:
+        """Checksum tally across every block.
+
+        Reserved partitions have no finalised checksum, so they are counted
+        separately rather than as failures.
+        """
+        total = reserved = valid = invalid = unknown = 0
+
+        for block in self.bosch_blocks:
+            for cs in block.checksum_structures:
+                total += 1
+                if block.is_unprogrammed:
+                    reserved += 1
+                elif cs.is_valid is None:
+                    unknown += 1
+                elif cs.is_valid:
+                    valid += 1
+                else:
+                    invalid += 1
+
+        return {
+            'total_checksums': total,
+            'checkable_checksums': total - reserved,
+            'valid_checksums': valid,
+            'invalid_checksums': invalid,
+            'unknown_checksums': unknown,
+            'reserved_checksums': reserved,
+            'all_valid': invalid == 0,
+        }
 
     def _is_flash_addr(self, addr: int) -> bool:
         """Cached (0x8xxxxxxx) or uncached (0xAxxxxxxx) TriCore flash address.
@@ -940,16 +1035,7 @@ class MEDC17BinaryParser:
             print_error("No erased slot found in dataset region for CVN patch")
             return False
 
-        base = self.cvn_config.base_address
-        patch_in_region = False
-        for mem_start, mem_end in self.cvn_config.regions:
-            file_start = mem_start - base
-            file_end = mem_end - base
-            if file_start <= patch_offset < file_end:
-                patch_in_region = True
-                break
-
-        if not patch_in_region:
+        if not self._offset_in_cvn_region(patch_offset):
             print_error("CVN patch location not within any CVN region")
             return False
 
@@ -1012,6 +1098,91 @@ class MEDC17BinaryParser:
         """Standard CRC32 (zlib) over an inclusive byte range — the CompTest CRC."""
         import zlib
         return zlib.crc32(bytes(data[start:end_incl + 1])) & 0xFFFFFFFF
+
+    def _offset_in_cvn_region(self, offset: int) -> bool:
+        """Whether a file offset falls inside one of the CVN's covered regions."""
+        if self.cvn_config is None:
+            return False
+
+        base = self.cvn_config.base_address
+        for mem_start, mem_end in self.cvn_config.regions:
+            if (mem_start - base) <= offset < (mem_end - base):
+                return True
+
+        return False
+
+    def cvn_feasibility(self, data=None) -> dict:
+        """Report the CVN, and whether it can be preserved, without touching the file.
+
+        Checks the same conditions correct_cvn_best_effort relies on, so a caller
+        can offer CVN preservation only when it stands a chance of succeeding.
+        """
+        if data is None:
+            data = self.data
+
+        status = {
+            'available': self.cvn_config is not None,
+            'value': None,
+            'regions': 0,
+            'regions_in_file': 0,
+            'stored_comptest_crc': None,
+            'current_comptest_crc': None,
+            'comptest_matches': None,
+            'compensation_slot': None,
+            'preserve_supported': False,
+            'preserve_reason': None,
+            'match_original_supported': False,
+        }
+
+        if self.cvn_config is None:
+            status['preserve_reason'] = 'No CVN configuration found in this binary'
+            return status
+
+        base = self.cvn_config.base_address
+        readable = sum(1 for mem_start, mem_end in self.cvn_config.regions
+                       if 0 <= (mem_start - base) and (mem_end - base) <= len(data))
+
+        status['value'] = hex32(self.cvn_config.calculated_cvn)
+        status['regions'] = len(self.cvn_config.regions)
+        status['regions_in_file'] = readable
+
+        if readable < len(self.cvn_config.regions):
+            # A partial dump: the CVN covers flash this file doesn't contain, so
+            # the calculated value means nothing and nothing can be preserved
+            status['value'] = None
+            status['preserve_reason'] = ('CVN regions extend past the end of this file — '
+                                         'it looks like a partial dump')
+            return status
+
+        region_start, region_end_incl, blk_end = self._dataset_comptest_bounds()
+
+        if blk_end + 1 > len(data) or region_start < 0:
+            status['preserve_reason'] = 'Dataset CompTest CRC lies outside the binary'
+            return status
+
+        stored_crc = struct.unpack('<I', data[blk_end - 3:blk_end + 1])[0]
+        current_crc = self._region_crc32(data, region_start, region_end_incl)
+        slot = self.find_erased_slot(data, blk_end, region_start)
+
+        status['stored_comptest_crc'] = hex32(stored_crc)
+        status['current_comptest_crc'] = hex32(current_crc)
+        status['comptest_matches'] = stored_crc == current_crc
+        status['compensation_slot'] = hex32(slot) if slot is not None else None
+        status['match_original_supported'] = slot is not None and self._offset_in_cvn_region(slot)
+
+        if stored_crc in ERASED_DWORDS:
+            status['preserve_reason'] = ('Stored CompTest CRC is blank — this dataset carries no '
+                                         'CompTest checksum to restore the CVN from')
+        elif stored_crc == current_crc:
+            status['preserve_supported'] = True
+            status['preserve_reason'] = 'CompTest CRC already matches — the CVN is unchanged'
+        elif slot is None:
+            status['preserve_reason'] = ('No erased slot in the dataset region to hold the '
+                                         'compensation dword')
+        else:
+            status['preserve_supported'] = True
+
+        return status
 
     def _correct_cvn_multiregion(self, target_cvn: int, data: bytearray, patch_offset: int) -> bool:
         """Solve the CVN patch dword when the patch sits in a multi-region CRC.
@@ -1453,6 +1624,71 @@ class MEDC17BinaryParser:
 
         return corrected_count
 
+    def checksum_to_dict(self, cs: ChecksumStructure, block: BoschBlock, index: int) -> dict:
+        error = None
+        if cs.cs_algorithm not in self.ALGORITHM_NAMES:
+            error = f"Unsupported algorithm 0x{cs.cs_algorithm:02X}"
+        elif cs.calculated_checksum is None:
+            error = 'Checksum region lies outside the binary'
+
+        # CRC32 stores the complement of the value it compares against
+        expected = ((~cs.cs_expected_val) & 0xFFFFFFFF
+                    if cs.cs_algorithm == 0x00
+                    else cs.cs_expected_val)
+
+        return {
+            'index': index,
+            'algorithm': self.ALGORITHM_NAMES.get(cs.cs_algorithm, 'UNKNOWN'),
+            'offset': hex32(cs.offset),
+            'start': hex32(cs.cs_start),
+            'end': hex32(cs.cs_end),
+            'length': max(cs.cs_end - cs.cs_start + 1, 0),
+            'valid': None if block.is_unprogrammed else cs.is_valid,
+            'expected': None if block.is_unprogrammed else hex32(expected),
+            'calculated': hex32(cs.calculated_checksum),
+            'error': error,
+        }
+
+    def block_to_dict(self, block: BoschBlock, index: int) -> dict:
+        return {
+            'index': index,
+            'name': block.block_name,
+            'identifier': hex32(block.block_identifier),
+            'type_id': f"0x{block.block_type_id:02X}",
+            'file_start': hex32(block.bin_start),
+            'file_end': hex32(block.bin_end),
+            'memory_start': hex32(block.block_start),
+            'memory_end': hex32(block.block_end),
+            'size': block.size,
+            'sw_identifier': block.sw_identifier.decode('ascii', errors='ignore').strip('\x00 '),
+            'has_otp': block.has_otp,
+            'is_unprogrammed': block.is_unprogrammed,
+            'checksums': [
+                self.checksum_to_dict(cs, block, i)
+                for i, cs in enumerate(block.checksum_structures, 1)
+            ],
+        }
+
+    def to_dict(self) -> dict:
+        """Full validation state as plain data, for --json."""
+        variants = self.identify_ecu_variant()
+
+        document = {
+            'filename': self.binary_path.name,
+            'file_size': len(self.data),
+            'platform': 'MED17/EDC17',
+            'ecu_variant': variants[0] if variants else None,
+            'total_blocks': len(self.bosch_blocks),
+        }
+        document.update(self.checksum_counts())
+        document['blocks'] = [
+            self.block_to_dict(block, i)
+            for i, block in enumerate(self.bosch_blocks, 1)
+        ]
+        document['cvn'] = self.cvn_feasibility()
+
+        return document
+
     def print_summary(self) -> None:
         console.print()
 
@@ -1506,7 +1742,7 @@ class MEDC17BinaryParser:
                 cs_table.add_column("Status", width=10, justify="center")
 
                 for j, cs in enumerate(block.checksum_structures, 1):
-                    algo_name = {0x00: "CRC32", 0x01: "ADD32", 0x10: "ADD16"}.get(cs.cs_algorithm, "UNKNOWN")
+                    algo_name = self.ALGORITHM_NAMES.get(cs.cs_algorithm, "UNKNOWN")
                     range_str = f"0x{cs.cs_start:08X}\n0x{cs.cs_end:08X}"
 
                     if block.is_unprogrammed:
@@ -1545,16 +1781,175 @@ class MEDC17BinaryParser:
         self.cvn_config = self.find_cvn_config()
         if self.cvn_config:
             self.cvn_config.calculated_cvn = self.calculate_cvn()
-            print(f"[+] CVN: 0x{self.cvn_config.calculated_cvn:08X}")
+            console.print(f"[+] CVN: 0x{self.cvn_config.calculated_cvn:08X}")
 
-        self.print_summary()
+        if not QUIET:
+            self.print_summary()
 
 
-def main():
-    """Main entry point"""
+class ToolError(Exception):
+    """A fatal, user-facing failure: reported as JSON or plain text, exit code 2."""
+
+
+def fail(message: str, as_json: bool, **extra) -> None:
+    """Report a fatal error in the caller's chosen format and exit 2."""
+    if as_json:
+        document = {'error': message}
+        document.update(extra)
+        json.dump(document, sys.stdout)
+        print()
+    else:
+        print_error(message)
+
+    sys.exit(2)
+
+
+def run_correction(parser: 'MEDC17BinaryParser', args, output_path: str) -> dict:
+    """Preserve the CVN if asked, correct the checksums, and report the outcome.
+
+    CVN first: its compensation dword lands inside the checksummed range, so the
+    checksum passes have to run over the final bytes.
+    """
+    corrected_data = bytearray(parser.data)
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    report = {
+        'success': False,
+        'checksums_corrected': 0,
+        'output_path': output_path,
+        'cvn_mode': 'original' if args.fix_cvn else ('best_effort' if args.fix_cvn_inplace else 'none'),
+        'cvn_applied': False,
+        'cvn_before': hex32(parser.cvn_config.calculated_cvn) if parser.cvn_config else None,
+        'cvn_after': None,
+        'target_cvn': None,
+        'errors': errors,
+        'warnings': warnings,
+    }
+
+    target_cvn = None
+
+    if args.fix_cvn:
+        console.print()
+        console.print(Panel("[bold cyan]CVN Correction[/bold cyan]", border_style="cyan"))
+
+        if not Path(args.fix_cvn).exists():
+            raise ToolError(f"Original file not found: {args.fix_cvn}")
+
+        original_parser = MEDC17BinaryParser(args.fix_cvn)
+        original_parser.load_binary()
+        original_parser.find_bosch_blocks()
+        original_parser.cvn_config = original_parser.find_cvn_config()
+
+        if original_parser.cvn_config is None:
+            raise ToolError("Could not find CVN config in original file")
+
+        target_cvn = original_parser.calculate_cvn()
+        report['target_cvn'] = hex32(target_cvn)
+        print_info(f"Target CVN (from original): 0x{target_cvn:08X}")
+
+        parser.data = bytes(corrected_data)
+        current_cvn = parser.calculate_cvn()
+        print_info(f"Current CVN: 0x{current_cvn:08X}")
+
+        if current_cvn == target_cvn:
+            print_success("CVN already matches target")
+        else:
+            console.print("[yellow]Correcting CVN...[/yellow]")
+            if not parser.correct_cvn(target_cvn, corrected_data):
+                raise ToolError("CVN correction failed")
+            print_success(f"CVN patched for target 0x{target_cvn:08X}")
+
+        report['cvn_applied'] = True
+
+    if args.fix_cvn_inplace:
+        console.print()
+        console.print(Panel("[bold cyan]CVN Correction (best effort, no original)[/bold cyan]",
+                            border_style="cyan"))
+
+        parser.data = bytes(corrected_data)
+
+        if parser.cvn_config is None:
+            raise ToolError("Could not find CVN config in input file")
+
+        status = parser.cvn_feasibility(corrected_data)
+        if status['preserve_reason'] and not status['preserve_supported']:
+            raise ToolError(f"CVN cannot be preserved: {status['preserve_reason']}")
+
+        print_info(f"Current CVN: 0x{parser.calculate_cvn():08X}")
+
+        if not parser.correct_cvn_best_effort(corrected_data):
+            raise ToolError("Best-effort CVN correction failed")
+
+        parser.data = bytes(corrected_data)
+        print_info(f"Preserved CVN: 0x{parser.calculate_cvn():08X}")
+        report['cvn_applied'] = True
+
+    # Checksums last — the CVN patch lands inside their range
+    parser.data = bytes(corrected_data)
+    report['checksums_corrected'] = parser.correct_all_checksums(output_path)
+
+    # Re-validate what actually landed on disk, rather than trusting the state
+    # the correction passes left behind
+    with open(output_path, 'rb') as f:
+        final_data = f.read()
+
+    parser.data = final_data
+    parser.validate_all_checksums()
+    counts = parser.checksum_counts()
+
+    report['after'] = {
+        'all_valid': counts['all_valid'],
+        'total_checksums': counts['total_checksums'],
+        'valid_checksums': counts['valid_checksums'],
+        'invalid_checksums': counts['invalid_checksums'],
+        'cvn': None,
+        'comptest_matches': None,
+    }
+
+    if counts['invalid_checksums']:
+        errors.append(f"{counts['invalid_checksums']} checksum(s) still invalid after correction")
+
+    if counts['unknown_checksums']:
+        warnings.append(f"{counts['unknown_checksums']} checksum(s) use an unsupported algorithm "
+                        "and were left unchanged")
+
+    if parser.cvn_config is not None:
+        final_cvn = parser.calculate_cvn()
+        report['cvn_after'] = hex32(final_cvn)
+        report['after']['cvn'] = hex32(final_cvn)
+
+        if args.fix_cvn:
+            console.print()
+            console.print("[dim]Verifying CVN after checksum correction...[/dim]")
+            if final_cvn == target_cvn:
+                print_success(f"CVN verified: 0x{final_cvn:08X}")
+            else:
+                print_error(f"CVN verification failed: got 0x{final_cvn:08X}")
+                errors.append(f"CVN verification failed: got {hex32(final_cvn)}, "
+                              f"expected {hex32(target_cvn)}")
+
+        if args.fix_cvn_inplace:
+            console.print()
+            console.print("[dim]Verifying CVN after checksum correction...[/dim]")
+            status = parser.cvn_feasibility(final_data)
+            report['after']['comptest_matches'] = status['comptest_matches']
+
+            if status['comptest_matches']:
+                print_success(f"CompTest CRC verified: {status['current_comptest_crc']} "
+                              f"(CVN preserved: {hex32(final_cvn)})")
+            else:
+                print_error(f"CompTest verification failed: got {status['current_comptest_crc']}, "
+                            f"expected {status['stored_comptest_crc']}")
+                errors.append('CompTest CRC no longer matches — the CVN was not preserved')
+
+    report['success'] = not errors and counts['all_valid']
+
+    return report
+
+
+def parse_arguments():
     import argparse
-
-    print_banner()
 
     parser_args = argparse.ArgumentParser(
         description='MEDC17 Checksum Analyzer & Corrector v1.1',
@@ -1575,6 +1970,14 @@ Examples:
 
   # Correct checksums AND preserve CVN without the original file
   %(prog)s modified.bin --correct --fix-cvn-inplace -o fixed.bin
+
+  # Machine-readable report, no third-party dependencies
+  %(prog)s firmware.bin --json
+
+Exit codes:
+  0  all checksums valid (or every correction succeeded)
+  1  invalid checksums found (or a correction did not succeed)
+  2  error — file missing, not a MED17/EDC17 binary, bad arguments
         '''
     )
 
@@ -1590,139 +1993,82 @@ Examples:
     parser_args.add_argument('--fix-cvn-inplace', action='store_true',
                            help='Preserve CVN without the original file (best effort, '
                                 'via the stored CompTest CRC)')
+    parser_args.add_argument('--json', action='store_true',
+                           help='Emit one JSON document on stdout and nothing else '
+                                '(for programmatic use)')
 
-    args = parser_args.parse_args()
+    return parser_args.parse_args()
 
-    if args.correct and args.overwrite and args.output:
-        print_error("Cannot specify both --output and --overwrite")
-        sys.exit(1)
 
-    if args.fix_cvn and args.fix_cvn_inplace:
-        print_error("Cannot specify both --fix-cvn and --fix-cvn-inplace")
-        sys.exit(1)
-
+def main():
+    """Main entry point"""
     import time
-    start_time = time.time()
+
+    args = parse_arguments()
+    set_quiet(args.json)
+
+    if not args.json:
+        print_banner()
 
     try:
+        if args.correct and args.overwrite and args.output:
+            raise ToolError('Cannot specify both --output and --overwrite')
+
+        if args.fix_cvn and args.fix_cvn_inplace:
+            raise ToolError('Cannot specify both --fix-cvn and --fix-cvn-inplace')
+
+        start_time = time.time()
+
         parser = MEDC17BinaryParser(args.binary_file)
-        parser.parse()
 
-        output_path = None
-        if args.output:
-            output_path = args.output
-        elif args.overwrite:
-            output_path = args.binary_file
+        try:
+            parser.parse()
+        except FileNotFoundError:
+            raise ToolError(f"File not found: {args.binary_file}")
+        except OSError as e:
+            raise ToolError(f"Could not read {args.binary_file}: {e}")
 
-        if args.correct or args.fix_cvn or args.fix_cvn_inplace:
-            if not output_path:
-                console.print()
-                print_warning("Correction requested but no output path given")
-                print_info("Use --output <file> or --overwrite to save corrections")
-            else:
-                corrected_data = bytearray(parser.data)
+        if not parser.bosch_blocks:
+            raise ToolError('No Bosch checksum blocks found — is this a MED17/EDC17 binary?')
 
-                # CVN first: its patch lands inside the checksummed range
-                if args.fix_cvn:
-                    console.print()
-                    console.print(Panel("[bold cyan]CVN Correction[/bold cyan]",
-                                      border_style="cyan"))
+        # Snapshot the incoming state before anything is corrected
+        document = parser.to_dict() if args.json else None
 
-                    if not Path(args.fix_cvn).exists():
-                        print_error(f"Original file not found: {args.fix_cvn}")
-                        sys.exit(1)
+        output_path = args.output or (args.binary_file if args.overwrite else None)
+        wants_correction = args.correct or args.fix_cvn or args.fix_cvn_inplace
 
-                    original_parser = MEDC17BinaryParser(args.fix_cvn)
-                    original_parser.load_binary()
-                    original_parser.find_bosch_blocks()
-                    original_parser.cvn_config = original_parser.find_cvn_config()
+        correction = None
+        if wants_correction and output_path is None:
+            if args.json:
+                raise ToolError('Correction requested but no output path given')
 
-                    if original_parser.cvn_config is None:
-                        print_error("Could not find CVN config in original file")
-                        sys.exit(1)
+            console.print()
+            print_warning('Correction requested but no output path given')
+            print_info('Use --output <file> or --overwrite to save corrections')
+        elif wants_correction:
+            correction = run_correction(parser, args, output_path)
 
-                    target_cvn = original_parser.calculate_cvn()
-                    print_info(f"Target CVN (from original): 0x{target_cvn:08X}")
+        if args.json:
+            document['correction'] = correction
+            json.dump(document, sys.stdout)
+            print()
+        else:
+            console.print()
+            console.print(f"[dim]Completed in {time.time() - start_time:.2f}s[/dim]")
 
-                    parser.data = bytes(corrected_data)
-                    current_cvn = parser.calculate_cvn()
-                    print_info(f"Current CVN: 0x{current_cvn:08X}")
+        if correction is not None:
+            sys.exit(0 if correction['success'] else 1)
 
-                    if current_cvn == target_cvn:
-                        print_success("CVN already matches target")
-                    else:
-                        console.print("[yellow]Correcting CVN...[/yellow]")
-                        success = parser.correct_cvn(target_cvn, corrected_data)
+        sys.exit(0 if parser.checksum_counts()['all_valid'] else 1)
 
-                        if not success:
-                            print_error("CVN correction failed")
-                            sys.exit(1)
-
-                        print_success(f"CVN patched for target 0x{target_cvn:08X}")
-
-                if args.fix_cvn_inplace:
-                    console.print()
-                    console.print(Panel("[bold cyan]CVN Correction (best effort, no original)[/bold cyan]",
-                                      border_style="cyan"))
-
-                    parser.data = bytes(corrected_data)
-                    if parser.cvn_config is None:
-                        print_error("Could not find CVN config in input file")
-                        sys.exit(1)
-
-                    print_info(f"Current CVN: 0x{parser.calculate_cvn():08X}")
-                    success = parser.correct_cvn_best_effort(corrected_data)
-                    if not success:
-                        print_error("Best-effort CVN correction failed")
-                        sys.exit(1)
-                    parser.data = bytes(corrected_data)
-                    print_info(f"Preserved CVN: 0x{parser.calculate_cvn():08X}")
-
-                # Checksums last — the CVN patch lands inside their range
-                parser.data = bytes(corrected_data)
-                parser.correct_all_checksums(output_path)
-
-                with open(output_path, 'rb') as f:
-                    corrected_data = bytearray(f.read())
-
-                if args.fix_cvn:
-                    console.print()
-                    console.print("[dim]Verifying CVN after checksum correction...[/dim]")
-                    parser.data = bytes(corrected_data)
-                    new_cvn = parser.calculate_cvn()
-                    if new_cvn == target_cvn:
-                        print_success(f"CVN verified: 0x{new_cvn:08X}")
-                    else:
-                        print_error(f"CVN verification failed: got 0x{new_cvn:08X}")
-
-                # Confirm the CompTest CRC — and so the CVN — survived pass 2
-                if args.fix_cvn_inplace:
-                    console.print()
-                    console.print("[dim]Verifying CVN after checksum correction...[/dim]")
-                    parser.data = bytes(corrected_data)
-                    bounds = parser._dataset_comptest_bounds()
-                    r_start, r_end, blk_end = bounds
-                    stored = struct.unpack('<I', corrected_data[blk_end - 3:blk_end + 1])[0]
-                    got = parser._region_crc32(corrected_data, r_start, r_end)
-                    if got == stored:
-                        print_success(f"CompTest CRC verified: 0x{got:08X} "
-                                      f"(CVN preserved: 0x{parser.calculate_cvn():08X})")
-                    else:
-                        print_error(f"CompTest verification failed: got 0x{got:08X}, "
-                                    f"expected 0x{stored:08X}")
-
-        elapsed = time.time() - start_time
-        console.print()
-        console.print(f"[dim]Completed in {elapsed:.2f}s[/dim]")
-
-    except FileNotFoundError as e:
-        print_error(f"File not found: {args.binary_file}, {e}")
-        sys.exit(1)
+    except ToolError as e:
+        fail(str(e), args.json, filename=os.path.basename(args.binary_file))
     except Exception as e:
-        print_error(f"Unexpected error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        if not args.json:
+            import traceback
+            traceback.print_exc()
+
+        fail(f"Unexpected error: {e}", args.json, filename=os.path.basename(args.binary_file))
 
 
 if __name__ == "__main__":
