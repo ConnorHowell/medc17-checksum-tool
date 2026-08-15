@@ -40,7 +40,7 @@ Got a custom ECU tool you want built? Need reverse engineering work done? Workin
 
 ## Requirements
 
-Python 3.7+ with `rich` package:
+Python 3.7+. The `rich` package is optional — it only pretties up the report, and `--json` never needs it:
 ```bash
 pip install rich
 ```
@@ -67,6 +67,14 @@ python main.py modified.bin --correct --fix-cvn original.bin --output fixed.bin
 python main.py modified.bin --correct --fix-cvn-inplace --output fixed.bin
 ```
 
+### Machine-readable output
+```bash
+python main.py firmware.bin --json
+```
+Writes a single JSON document to stdout — blocks, every checksum with its calculated and expected
+value, CVN status and whether the CVN can be preserved — and nothing else. Exit code `0` means all
+checksums are valid (or every correction succeeded), `1` means invalid checksums, `2` an error.
+
 ### Options
 ```
   -h, --help            Show help
@@ -74,7 +82,16 @@ python main.py modified.bin --correct --fix-cvn-inplace --output fixed.bin
   -o OUTPUT, --output   Output file path for corrected binary
   --fix-cvn ORIGINAL    Fix CVN to match the CVN from ORIGINAL file
   --fix-cvn-inplace     Preserve CVN without the original file (best effort)
+  --json                Emit one JSON document on stdout and nothing else
 ```
+
+### Hosted version
+
+If you'd rather not run this locally, the same correction is available as a web tool at
+[howellsystems.co.uk/tools](https://howellsystems.co.uk/tools) — upload a binary, see what's invalid
+before you commit to anything, download the corrected file. The other tools I've built around these
+ECUs live there too: original file extraction from FRF/ODX/PDX containers, MG1/MD1 checksum
+correction, and DTC deletion for EDC17/MED17.
 
 ## How It Works
 
