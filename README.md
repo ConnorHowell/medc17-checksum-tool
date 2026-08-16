@@ -132,7 +132,7 @@ This approach works across different MED17/EDC17 variants without requiring vari
 |-----------|---------------|-----------------|---------|
 | **CRC32** | 0xFADECAFE | 0x35015001 | IEEE 802.3 (0xEDB88320) bit-reversed polynomial |
 | **ADD32** | 0xFADECAFE | 0xCAFEAFFE | 32-bit dword sum (overflow ignored) |
-| **ADD16** | 0xFADECAFE | 0xCAFEAFFE | Sum of 16-bit words from 32-bit dwords |
+| **ADD16** | 0xFADECAFE | 0xCAFEAFFE | Sum of 16-bit words from 32-bit dwords — the final word is added into the high half, so the region's last dword counts as a full 32-bit value |
 
 ## TODO
 

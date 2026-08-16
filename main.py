@@ -779,8 +779,20 @@ class MEDC17BinaryParser:
     def calculate_add16_checksum(self, start: int, end_inclusive: int, initial_value: int) -> int:
         """ADD16 checksum, algorithm 0x10 (SB_ADD16_ALGO_E): sum of 16-bit words.
 
+        The main loop folds each dword the way the DLL does:
+
             lc = *startAdr++;
             chkSum_u32 += (uint16)lc + (uint16)(lc >> 16);
+
+        The final word is the exception — it lands in the high half instead of
+        being folded down. That makes the last dword of the region contribute its
+        full 32-bit value (low word flat, high word shifted), which is what turns
+        it into the adjust slot correct_add16_checksum writes to: the checksum
+        then moves by exactly the value added there.
+
+        Do not "simplify" the tail to a flat add. Verified against factory
+        firmware (07P906027A): flat gives 0x4291386C where the ECU expects
+        0xCAFEAFFE, shifted reproduces the stored value exactly.
         """
         if start < 0 or end_inclusive >= len(self.data) or start > end_inclusive:
             return 0
@@ -793,9 +805,9 @@ class MEDC17BinaryParser:
             pos += 2
             checksum = (checksum + word) & 0xFFFFFFFF
 
-        # Trailing word
+        # Last 16-bit word goes into the high 16 bits
         word = self.data[pos] | (self.data[pos + 1] << 8)
-        checksum = (checksum + word) & 0xFFFFFFFF
+        checksum = (checksum + (word << 16)) & 0xFFFFFFFF
 
         return checksum
 
