@@ -1154,7 +1154,9 @@ class MEDC17BinaryParser:
         readable = sum(1 for mem_start, mem_end in self.cvn_config.regions
                        if 0 <= (mem_start - base) and (mem_end - base) <= len(data))
 
-        status['value'] = hex32(self.cvn_config.calculated_cvn)
+        # Recomputed from the data handed in, so the same call reports the CVN
+        # before and after a correction
+        status['value'] = hex32(self.calculate_cvn(bytes(data)))
         status['regions'] = len(self.cvn_config.regions)
         status['regions_in_file'] = readable
 
@@ -1832,7 +1834,7 @@ def run_correction(parser: 'MEDC17BinaryParser', args, output_path: str) -> dict
         'output_path': output_path,
         'cvn_mode': 'original' if args.fix_cvn else ('best_effort' if args.fix_cvn_inplace else 'none'),
         'cvn_applied': False,
-        'cvn_before': hex32(parser.cvn_config.calculated_cvn) if parser.cvn_config else None,
+        'cvn_before': parser.cvn_feasibility()['value'],
         'cvn_after': None,
         'target_cvn': None,
         'errors': errors,
@@ -1927,9 +1929,10 @@ def run_correction(parser: 'MEDC17BinaryParser', args, output_path: str) -> dict
                         "and were left unchanged")
 
     if parser.cvn_config is not None:
+        final_status = parser.cvn_feasibility(final_data)
         final_cvn = parser.calculate_cvn()
-        report['cvn_after'] = hex32(final_cvn)
-        report['after']['cvn'] = hex32(final_cvn)
+        report['cvn_after'] = final_status['value']
+        report['after']['cvn'] = final_status['value']
 
         if args.fix_cvn:
             console.print()
@@ -1944,15 +1947,14 @@ def run_correction(parser: 'MEDC17BinaryParser', args, output_path: str) -> dict
         if args.fix_cvn_inplace:
             console.print()
             console.print("[dim]Verifying CVN after checksum correction...[/dim]")
-            status = parser.cvn_feasibility(final_data)
-            report['after']['comptest_matches'] = status['comptest_matches']
+            report['after']['comptest_matches'] = final_status['comptest_matches']
 
-            if status['comptest_matches']:
-                print_success(f"CompTest CRC verified: {status['current_comptest_crc']} "
+            if final_status['comptest_matches']:
+                print_success(f"CompTest CRC verified: {final_status['current_comptest_crc']} "
                               f"(CVN preserved: {hex32(final_cvn)})")
             else:
-                print_error(f"CompTest verification failed: got {status['current_comptest_crc']}, "
-                            f"expected {status['stored_comptest_crc']}")
+                print_error(f"CompTest verification failed: got {final_status['current_comptest_crc']}, "
+                            f"expected {final_status['stored_comptest_crc']}")
                 errors.append('CompTest CRC no longer matches — the CVN was not preserved')
 
     report['success'] = not errors and counts['all_valid']
