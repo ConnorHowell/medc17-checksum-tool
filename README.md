@@ -7,7 +7,7 @@ Checksum analyzer and corrector for Bosch MED17/EDC17 ECU firmware binaries.
 Analyzes and corrects checksums in Bosch MED17 and EDC17 ECU firmware files. Supports CRC32, ADD32, and ADD16 algorithms.
 
 > [!WARNING]
-> Currently tested primarily with calibration changes. Code section modifications may require additional validation. ECUs utilising the "Variant Dataset" may not currently be properly corrected by this tool.
+> Currently tested primarily with calibration changes. Code section modifications may require additional validation.
 
 ## Features
 
@@ -16,6 +16,7 @@ Analyzes and corrects checksums in Bosch MED17 and EDC17 ECU firmware files. Sup
 - ✅ **Instant CRC32 solving** - GF(2) matrix algebra
 - ✅ **RSA signature forging** - Generates valid Bleichenbacher signatures
 - ✅ **CVN correction** - Fix Calibration Verification Number to match original
+- ✅ **Multi-variant support** - Corrects the monitoring checksum for every calibration variant
 - ✅ **Safe operation** - Never overwrites original files
 
 ---
@@ -110,6 +111,20 @@ ECU firmware contains multiple Bosch blocks with checksums protecting different 
 ### CRC32 Mathematical Solving
 Traditional methods brute-force billions of values. This tool models CRC32 as 32 linear equations over GF(2), constructs a 32×32 matrix, and solves using Gaussian elimination.
 
+### Multi-variant calibrations
+
+Some ECUs carry more than one calibration variant. The variant dataset block (0x80) holds a table
+of parameter addresses per variant: most entries are shared, but where a variant overrides a
+parameter its entry points at a private copy instead.
+
+The monitoring checksum is calculated over whichever variant is active, so each one needs its own
+compensation value. Correcting only the first leaves the rest wrong, and an ECU running a
+non-default variant will reject the file — typically as a boot loop.
+
+The tool reads the variant count from the block header, locates the base address table and its
+per-variant copies, then for each variant resolves every read through that variant's table and
+writes its compensation value to the matching address.
+
 ### CVN (Calibration Verification Number)
 The CVN is a CRC32 checksum over specific memory regions that OBD-II diagnostics report to verify calibration integrity. When modifying calibration data, the CVN changes and will no longer match dealer records.
 
@@ -138,10 +153,13 @@ This approach works across different MED17/EDC17 variants without requiring vari
 
 Future enhancements planned:
 
-- [ ] **Sync blocks** - referenced by some tools, what are they??
-- [ ] **ECM/Code monitoring checksums** - Make sure all monitoring checksums are corrected
-- [ ] **Variant Dataset Correction** - Even with just calibration changes the VDS block epilog may need changes if it exists, needs investigation
+- [ ] **Sync blocks** - a commercial-vehicle feature: some ECUs carry a duplicate control block at a
+      second address range, and a corrected block is copied across so the two stay in sync. Not
+      implemented. At least one EDC17CV52 layout is a double block that must *not* be copied.
+- [x] **ECM/Code monitoring checksums** - the monitoring checksum is the per-variant one, now corrected
+- [x] **Variant Dataset Correction** - implemented; see [Multi-variant calibrations](#multi-variant-calibrations)
 - [ ] **Extended testing** - Validation with code section modifications beyond calibration changes
+- [ ] **Variant coverage** - the variant path is so far exercised against a single multi-variant file
 
 Contributions welcome!
 

@@ -18,10 +18,11 @@ import os
 import re
 import struct
 import sys
+import bisect
 import hashlib
 from types import SimpleNamespace
 from typing import List, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # rich is optional: the pretty CLI report uses it, --json never does. The plain
@@ -240,6 +241,21 @@ MEDC17_BLANK_WORDS = (0xFFFFFFFF, 0xAFAFAFAF)
 FLASH_SEGMENT_MASK = 0x0FFFFFFF          # offset within the 256 MB flash segment
 
 
+# Variant dataset ------------------------------------------------------------
+# ECUs with more than one calibration variant keep a table of parameter
+# addresses per variant. The monitoring checksum is calculated over whichever
+# variant is active, so every variant needs its own compensation value —
+# correcting only the first leaves the rest wrong.
+VARIANT_BLOCK_ID = 0x80
+VARIANT_COUNT_OFFSET = 0x7C           # variant count (main + overrides) in the 0x80 block header
+VARIANT_MONITOR_MARKER = b'\x61\x04\x04\x00'   # first 4 bytes of the monitored structure
+VARIANT_TABLE_MIN_RUN = 51            # shortest ascending run accepted as an address table
+VARIANT_TABLE_MIN_SPAN = 0x10000      # smallest address span an address table may cover
+VARIANT_TABLE_MIN_MATCH = 76          # percent of dwords a copy must share with the base table
+VARIANT_MAX_TABLES = 9
+VARIANT_REMAP_SENTINEL = 0x00FFFFFF   # entry value that aborts a table walk
+
+
 def flash_canonical(mem_addr: int) -> int:
     """Cached-segment form of a flash address, so the 0x80 and 0xA0 aliases of the
     same physical byte compare and translate identically."""
@@ -446,6 +462,29 @@ class CVNConfig:
 
 
 @dataclass
+class VariantTable:
+    """One variant's copy of the parameter address table."""
+    start: int          # file offset
+    end: int            # file offset, exclusive
+    match_pct: int
+
+
+@dataclass
+class VariantConfig:
+    """Everything needed to correct the per-variant monitoring checksums."""
+    block: 'BoschBlock'
+    count: int                      # main + overrides, from the block header
+    base_start: int                 # base address table, file offsets
+    base_end: int
+    region_start: int               # monitored region, file offsets
+    region_end: int                 # exclusive; the compensation dword sits here
+    adjust_offset: int
+    seed: int
+    expected: int
+    tables: List[VariantTable] = field(default_factory=list)
+
+
+@dataclass
 class BoschBlock:
     """Represents a Bosch checksum block"""
     bin_start: int
@@ -494,6 +533,7 @@ class MEDC17BinaryParser:
         self.data: bytes = b''
         self.bosch_blocks: List[BoschBlock] = []
         self.cvn_config: Optional[CVNConfig] = None
+        self.variant_config: Optional[VariantConfig] = None
 
     def load_binary(self) -> None:
         if not self.binary_path.exists():
@@ -903,6 +943,261 @@ class MEDC17BinaryParser:
         """
         return (0x80000000 <= addr <= 0x8FFFFFFF or
                 0xA0000000 <= addr <= 0xAFFFFFFF)
+
+    # Variant dataset --------------------------------------------------------
+
+    def _image_offset(self, mem_addr: int, data: bytes = None) -> Optional[int]:
+        """Flash address to file offset, image-wide, anchored on the lowest block."""
+        if not self.bosch_blocks:
+            return None
+        anchor = self.bosch_blocks[0]
+        offset = (flash_canonical(mem_addr)
+                  - flash_canonical(anchor.block_start)
+                  + anchor.bin_start)
+        limit = len(data if data is not None else self.data)
+        return offset if 0 <= offset < limit else None
+
+    def _entry_offset(self, value: int, data: bytes) -> Optional[int]:
+        """A table entry translated to a file offset, or None if unusable."""
+        if value == 0xFFFFFFFF:
+            return None
+        return self._image_offset(value, data)
+
+    def _find_monitored_region(self, data: bytes) -> Optional[tuple]:
+        """Locate the structure carrying the monitoring checksum.
+
+        Returns (region_start, region_end_exclusive, adjust_offset, seed, expected).
+        The structure is identified by its marker bytes; the last dword of its
+        range is the compensation slot and is excluded from the sum.
+        """
+        for block in self.bosch_blocks:
+            for cs in block.checksum_structures:
+                if data[cs.offset:cs.offset + 4] != VARIANT_MONITOR_MARKER:
+                    continue
+                start = self._image_offset(cs.cs_start, data)
+                end = self._image_offset(cs.cs_end, data)
+                if start is None or end is None or end - 4 <= start:
+                    continue
+                if struct.unpack_from('<I', data, end - 3)[0] in MEDC17_BLANK_WORDS:
+                    continue
+                return start, end - 4, end - 3, cs.cs_start_val, cs.cs_expected_val
+        return None
+
+    def _find_base_table(self, data: bytes, exclude: tuple = None) -> Optional[tuple]:
+        """Find the base parameter address table.
+
+        An address table is a long strictly-ascending run of flash addresses.
+        Returns (start_offset, end_offset_exclusive).
+        """
+        limit = len(data) - 4
+        run_start = None
+        prev = 0
+        pos = 0
+        while pos < limit:
+            if exclude and exclude[0] <= pos <= exclude[1]:
+                pos += 4
+                continue
+            value = struct.unpack_from('<I', data, pos)[0]
+            ascending = value > prev and self._is_flash_addr(value)
+            if ascending:
+                if run_start is None:
+                    run_start = pos
+                prev = value
+            else:
+                if run_start is not None and (pos - run_start) // 4 >= VARIANT_TABLE_MIN_RUN:
+                    first = struct.unpack_from('<I', data, run_start)[0]
+                    last = struct.unpack_from('<I', data, pos - 4)[0]
+                    if last - first >= VARIANT_TABLE_MIN_SPAN:
+                        return run_start, pos
+                run_start = None
+                prev = 0
+            pos += 4
+        return None
+
+    def _find_variant_tables(self, data: bytes, base_start: int,
+                             base_end: int) -> List[VariantTable]:
+        """Find copies of the base table — one per variant.
+
+        Variants share most of their entries with the base and differ only where
+        the variant overrides a parameter, so copies are matched by similarity
+        rather than equality.
+        """
+        length = base_end - base_start
+        words = length // 4
+        if words == 0:
+            return []
+        first = struct.unpack_from('<I', data, base_start)[0]
+        base_words = struct.unpack_from(f'<{words}I', data, base_start)
+
+        tables: List[VariantTable] = []
+        pos = base_end
+        while pos + length <= len(data):
+            if struct.unpack_from('<I', data, pos)[0] != first:
+                pos += 4
+                continue
+            other = struct.unpack_from(f'<{words}I', data, pos)
+            matched = sum(1 for a, b in zip(base_words, other) if a == b)
+            pct = (matched * 100) // words
+            if pct >= VARIANT_TABLE_MIN_MATCH:
+                tables.append(VariantTable(pos, pos + length, pct))
+                if len(tables) >= VARIANT_MAX_TABLES:
+                    break
+                pos += length
+                continue
+            pos += 4
+        return tables
+
+    def _table_offsets(self, data: bytes, start: int, length: int) -> tuple:
+        """Table entries as file offsets, plus the index where a walk would abort."""
+        words = length // 4
+        raw = struct.unpack_from(f'<{words}I', data, start)
+        offsets = [self._entry_offset(v, data) for v in raw]
+        stop = words
+        for i, (value, offset) in enumerate(zip(raw, offsets)):
+            if offset is None or value == VARIANT_REMAP_SENTINEL:
+                stop = i
+                break
+        return offsets, stop
+
+    def _build_remap(self, data: bytes, cfg: VariantConfig,
+                     table: VariantTable) -> tuple:
+        """Precompute the base/variant offset pair used to translate addresses."""
+        length = cfg.base_end - cfg.base_start
+        base_offsets, base_stop = self._table_offsets(data, cfg.base_start, length)
+        var_offsets, var_stop = self._table_offsets(data, table.start, length)
+        return base_offsets, var_offsets, min(base_stop, var_stop)
+
+    def _remap_offset(self, offset: int, remap: tuple) -> Optional[int]:
+        """Translate a file offset from the base table's layout into a variant's.
+
+        Entries are slot boundaries: the offset is located between two adjacent
+        base entries and re-based onto the matching slot of the variant table,
+        keeping its position within the slot.
+        """
+        base_offsets, var_offsets, stop = remap
+        index = bisect.bisect_right(base_offsets, offset, 0, stop) - 1
+        if index < 0 or index + 1 >= stop:
+            return None
+        low, high = base_offsets[index], base_offsets[index + 1]
+        if not (low <= offset < high - 1):
+            return None
+        return var_offsets[index] - low + offset
+
+    def _variant_sum(self, data: bytes, cfg: VariantConfig,
+                     remap: Optional[tuple]) -> int:
+        """Sum the monitored region as the given variant sees it.
+
+        Reads resolve through the variant's table, so an overridden parameter
+        contributes the variant's own copy rather than the shared one.
+        """
+        total = cfg.seed
+        for addr in range(cfg.region_start, cfg.region_end, 4):
+            word = 0
+            for half in (0, 2):
+                src = addr + half
+                if remap is not None:
+                    mapped = self._remap_offset(src, remap)
+                    if mapped is not None and 0 <= mapped + 2 <= len(data):
+                        src = mapped
+                word |= struct.unpack_from('<H', data, src)[0] << (half * 8)
+            total = (total + word) & 0xFFFFFFFF
+        return total
+
+    def find_variant_config(self, data: bytes = None) -> Optional[VariantConfig]:
+        """Detect a multi-variant calibration and everything needed to correct it."""
+        data = self.data if data is None else data
+
+        block = next((b for b in self.bosch_blocks
+                      if b.block_type_id == VARIANT_BLOCK_ID), None)
+        if block is None:
+            return None
+
+        count = self.read_dword_le(block.bin_start + VARIANT_COUNT_OFFSET)
+        if count <= 1 or count > VARIANT_MAX_TABLES + 1:
+            return None
+
+        region = self._find_monitored_region(data)
+        if region is None:
+            return None
+
+        base = self._find_base_table(data, exclude=(block.bin_start, block.bin_end))
+        if base is None:
+            base = self._find_base_table(data)
+        if base is None:
+            return None
+
+        cfg = VariantConfig(
+            block=block,
+            count=count,
+            base_start=base[0],
+            base_end=base[1],
+            region_start=region[0],
+            region_end=region[1],
+            adjust_offset=region[2],
+            seed=region[3],
+            expected=region[4],
+        )
+        cfg.tables = self._find_variant_tables(data, cfg.base_start, cfg.base_end)
+        self.variant_config = cfg
+        return cfg
+
+    def correct_variant_checksums(self, data: bytearray) -> int:
+        """Write a compensation dword for every variant. Returns the number written.
+
+        Must run before the CRC32 pass — the values land inside checksummed
+        blocks.
+        """
+        cfg = self.find_variant_config(bytes(data))
+        if cfg is None:
+            return 0
+
+        if not cfg.tables:
+            print_warning("Variant dataset present but no variant tables found "
+                          "— per-variant checksums not corrected")
+            return 0
+
+        written = 0
+        for index, table in enumerate([None] + cfg.tables):
+            remap = None
+            if table is None:
+                target = cfg.adjust_offset
+                label = "main"
+            else:
+                remap = self._build_remap(bytes(data), cfg, table)
+                target = self._remap_offset(cfg.adjust_offset, remap)
+                label = f"variant {index}"
+                if target is None:
+                    print_warning(f"{label}: compensation address not in table — skipped")
+                    continue
+            if target + 4 > len(data):
+                print_warning(f"{label}: compensation address outside binary — skipped")
+                continue
+
+            total = self._variant_sum(bytes(data), cfg, remap)
+            adjust = (cfg.expected - total) & 0xFFFFFFFF
+            current = struct.unpack_from('<I', data, target)[0]
+            if current == adjust:
+                console.print(f"  {label}: [green]✓[/green] Already valid")
+                continue
+            struct.pack_into('<I', data, target, adjust)
+            console.print(f"  {label}: 0x{current:08X} → [cyan]0x{adjust:08X}[/cyan] "
+                          f"at 0x{target:08X}")
+            written += 1
+        return written
+
+    def variant_to_dict(self) -> Optional[dict]:
+        cfg = self.variant_config or self.find_variant_config()
+        if cfg is None:
+            return None
+        return {
+            'variants': cfg.count,
+            'tables_found': len(cfg.tables),
+            'base_table': {'start': hex32(cfg.base_start), 'end': hex32(cfg.base_end)},
+            'monitored_region': {'start': hex32(cfg.region_start),
+                                 'end': hex32(cfg.region_end),
+                                 'adjust': hex32(cfg.adjust_offset)},
+            'similarity': [t.match_pct for t in cfg.tables],
+        }
 
     def find_cvn_config(self) -> Optional[CVNConfig]:
         """Find and parse the CVN config: pointers to the regions the CVN covers."""
@@ -1573,6 +1868,15 @@ class MEDC17BinaryParser:
                 else:
                     print_error("Correction failed")
 
+        # Per-variant monitoring checksums, before CRC32 for the same reason
+        if self.find_variant_config(bytes(corrected_data)):
+            console.print()
+            console.print("[bold blue]PASS 1b:[/bold blue] Correcting per-variant "
+                          "monitoring checksums")
+            console.print()
+            corrected_count += self.correct_variant_checksums(corrected_data)
+            self.data = bytes(corrected_data)
+
         # Pass 2: CRC32, which must follow pass 1 — it covers the ADD-corrected bytes
         console.print()
         console.print("[bold blue]PASS 2:[/bold blue] Correcting CRC32 checksums")
@@ -1700,6 +2004,7 @@ class MEDC17BinaryParser:
             for i, block in enumerate(self.bosch_blocks, 1)
         ]
         document['cvn'] = self.cvn_feasibility()
+        document['variant_dataset'] = self.variant_to_dict()
 
         return document
 
@@ -1796,6 +2101,17 @@ class MEDC17BinaryParser:
         if self.cvn_config:
             self.cvn_config.calculated_cvn = self.calculate_cvn()
             console.print(f"[+] CVN: 0x{self.cvn_config.calculated_cvn:08X}")
+
+        cfg = self.find_variant_config()
+        if cfg:
+            console.print(f"[+] Variant dataset: {cfg.count} variants, "
+                          f"{len(cfg.tables)} tables found")
+            console.print(f"    Monitored region 0x{cfg.region_start:08X}-"
+                          f"0x{cfg.region_end:08X}, compensation at "
+                          f"0x{cfg.adjust_offset:08X}")
+            if len(cfg.tables) + 1 != cfg.count:
+                print_warning(f"Header declares {cfg.count} variants but "
+                              f"{len(cfg.tables) + 1} tables were located")
 
         if not QUIET:
             self.print_summary()
